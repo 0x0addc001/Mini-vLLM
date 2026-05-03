@@ -17,7 +17,7 @@ config = {
     'max_num_batched_tokens': 1024,
     'max_cached_blocks': 1024,
     'block_size': 256,
-    'world_size': 1,
+    # 'world_size': 1,
     'model_name_or_path': 'Qwen/Qwen3-0.6B',
     'enforce_eager': True,
     'vocab_size': 151936,  # Fixed: was 151643, HF model uses 151936
@@ -38,6 +38,17 @@ config = {
     'max_model_length': 128,
     'gpu_memory_utilization': 0.9,
     'eos': 151645,  # Fixed: should match tokenizer.eos_token_id
+    # -------------------------------------------------------------------- #
+    # 以下是全局 KV cache 池相关配置，启用后可在多 GPU 之间共享 KV cache，支持更大模型和更长上下文，但需要更多通信开销
+    # -------------------------------------------------------------------- #
+    'world_size': 2,
+    'enable_global_pool': True,             # 启用全局 KV cache 池
+    'swap_threshold': 0.85,                 # GPU 显存使用率阈值，超此值触发 swap
+    'global_page_table_sync_interval': 10,  # 全局页表广播间隔（调度周期数）
+    'nvlink_topo': {                        # NVLink 拓扑信息
+        'pairs': [(0,2), (1,3), (4,5), (6,7)],       # NVLink 直连 GPU 对
+        'sockets': [[0,1,2,3], [4,5,6,7]],  # 同 CPU Socket 分组
+    },
 }
 
 def main():

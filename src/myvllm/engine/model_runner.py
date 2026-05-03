@@ -5,14 +5,26 @@ import torch.distributed as dist
 from pathlib import Path
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
+from typing import List
 
 from myvllm.models.qwen3 import Qwen3ForCausalLM
 from myvllm.models.llama import LlamaForCausalLM
 from myvllm.layers.sampler import SamplerLayer
 from myvllm.engine.sequence import Sequence
+from myvllm.engine.global_block_manager import GlobalBlockManager
 from myvllm.utils import *
 
+
 class ModelRunner:
+    """
+    模型执行器
+
+    扩展功能（当启用全局池化时）：
+    - 初始化 GlobalBlockManager
+    - run() 前自动拉取 seq.pending_swap_in 中的远程块
+    - 提供 kv_cache 张量引用给 kv_transfer 做实际数据传输
+    """
+
     def __init__(self, config: dict, rank: int, event: Event | list[Event]):
         self.config = config
         self.event = event
@@ -21,10 +33,25 @@ class ModelRunner:
         self.block_size = config['block_size']
         self.world_size = config['world_size']
         self.enforce_eager = config.get('enforce_eager', False)
+        self.enable_global_pool = config.get('enable_global_pool', False)
 
         self.rank = rank
         dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)
         torch.cuda.set_device(rank)
+
+        # ----------------------------------------------- #
+        # 初始化 GlobalBlockManager（仅在启用全局池化时）
+        # ----------------------------------------------- #
+        if self.enable_global_pool:
+            self.gbm = GlobalBlockManager(
+                rank=rank,
+                world_size=self.world_size,
+                num_blocks_per_gpu=config['max_cached_blocks'],
+                nvlink_pairs=config.get('nvlink_topo', {}).get('pairs', []),
+                socket_groups=config.get('nvlink_topo', {}).get('sockets', []),
+            )
+        else:
+            self.gbm = None
 
         # set model
         path_str = self.config['model_name_or_path']
@@ -85,7 +112,7 @@ class ModelRunner:
         self.default_dtype = torch.get_default_dtype()
 
         # Debug flag for first decode step
-        self._first_decode = False
+        # self._first_decode = False
 
         # warm up model so that we know peak memory usage
         self.warmup_model()
@@ -110,7 +137,7 @@ class ModelRunner:
                     old_shm.close()
                     old_shm.unlink()
                 except FileNotFoundError:
-                    pass  # Doesn't exist, which is fine
+                    pass
                 self.shm = SharedMemory(name='myvllm', create=True, size=2**20)
                 # Barrier to ensure rank 1 waits until shared memory is created
                 dist.barrier()
@@ -118,14 +145,15 @@ class ModelRunner:
                 # Wait for rank 0 to create shared memory
                 dist.barrier()
                 self.shm = SharedMemory(name='myvllm')
-                # Don't call self.loop() here - let the spawning code handle it
-                # Otherwise we'll be stuck in an infinite loop during __init__
 
-    # only use read when rank != 0
+    # ------------------------------------------------------------------
+    # 共享内存读写
+    # ------------------------------------------------------------------
+
     def read_shm(self):
         assert self.world_size > 1 and self.rank != 0, "read_shm can only be called when world_size > 1 and rank != 0"
         self.event.wait()
-        n = int.from_bytes(self.shm.buf[:4], 'little') # read length
+        n = int.from_bytes(self.shm.buf[:4], 'little')
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
         self.event.clear()
         return method_name, args
@@ -155,15 +183,12 @@ class ModelRunner:
         # Check if process group exists before destroying
         if dist.is_initialized():
             dist.destroy_process_group()
-    
-    # wait to read method and args from shared memory
-    # execute the method with args
-    # write results back to shared memory
+
     def loop(self):
         assert self.world_size > 1 and self.rank != 0, "loop can only be called when world_size > 1 and rank != 0"
         while True:
             method_name, args = self.read_shm()
-            self.call(method_name, *args) # Unpack args when calling
+            self.call(method_name, *args)
             if method_name == 'exit':
                 self.exit()
                 break
@@ -172,17 +197,17 @@ class ModelRunner:
     # given method name and args from shared memory
     # execute the method and return results
     def call(self, method_name: str, *args: dict):
-        if self.world_size > 1 and self.rank == 0: # will be called in main engine
+        if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, args)
         method = getattr(self, method_name, None)
         if method:
             return method(*args)
         raise ValueError(f"Unknown method: {method_name}")
 
-    # cleanup memory
-    # compute max number of sequence based on max token and max model length
-    # run empty sequence to warm up the model
-    # clear memory
+    # ------------------------------------------------------------------
+    # 预热 & KV cache 分配
+    # ------------------------------------------------------------------
+
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -202,8 +227,7 @@ class ModelRunner:
         current_mem_usage = torch.cuda.memory_stats()['allocated_bytes.all.current']
         # reserve some room for peak memory usage during model execution
         available_mem = total_free_mem - (peak_mem_usage - current_mem_usage)
-        
-        # find parameters to compute kv cache size
+
         num_layers = self.config['num_layers']
         num_kv_heads = self.config['num_kv_heads'] // self.world_size
         head_dim = self.config['head_dim'] if 'head_dim' in self.config else self.config['hidden_size'] // self.config['num_heads']
@@ -213,14 +237,7 @@ class ModelRunner:
         block_bytes = self.block_size * 2 * num_layers * num_kv_heads * head_dim * self.default_dtype.itemsize
         num_available_kv_blocks = int(available_mem // block_bytes)
         assert num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
-        
-        # Synchronize max_cached_blocks across all ranks.
-        # Each rank independently computed num_available_kv_blocks from its own
-        # free GPU memory. Ranks may differ slightly: rank-0 carries extra overhead
-        # (NCCL buffers, process-group state) so it often has less free memory than
-        # workers. Without sync, the scheduler (which runs only on rank-0) would use
-        # rank-0's local value and could allocate more blocks than some rank can hold,
-        # causing an OOM on that rank during KV cache writes.
+
         if self.world_size > 1:
             print(f"[Rank {self.rank}] Local max_cached_blocks: {num_available_kv_blocks}")
             per_rank_max_blocks_tensor = torch.tensor(
@@ -241,10 +258,10 @@ class ModelRunner:
         if self.rank == 0:
             print(f"[Rank 0] Global max_cached_blocks (min): {self.config['max_cached_blocks']}")
 
-        # allocate max possible kv cache for the model, instead for each sequence
-        # this is the key for paged attention: one giant KV cache pool, divided into blocks
-        # IMPORTANT: Use zeros() instead of empty() to avoid garbage values
-        allocated_kv_cache = torch.zeros(2, self.config['num_layers'], self.config['max_cached_blocks'], self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
+        allocated_kv_cache = torch.zeros(
+            2, self.config['num_layers'], self.config['max_cached_blocks'],
+            self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}'
+        )
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, 'k_cache') and hasattr(module, 'v_cache'):
@@ -317,8 +334,8 @@ class ModelRunner:
     # prepare input data for decoding
     def prepare_decode(self, seqs: list[Sequence]) -> torch.Tensor:
         input_ids = []
-        context_lens = []   
-        slot_mappings = []  
+        context_lens = []
+        slot_mappings = []
         block_tables = []
         for seq in seqs:
             input_ids.append(seq.last_token)
@@ -340,7 +357,7 @@ class ModelRunner:
             context_lens=torch.tensor(context_lens, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
             block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
         )
-        return input_ids    
+        return input_ids
 
     # prepare the temperature
     def prepare_sample(self, seqs: list[Sequence]) -> None:
@@ -384,6 +401,23 @@ class ModelRunner:
     # sample logits
     # reset context
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        """
+        执行 prefill 或 decode
+
+        全局池化扩展：
+        - 在执行模型 forward 之前，检查每个序列是否有 pending_swap_in
+        - 如果有，调用 _swap_in_remote_blocks 拉取远端 KV 块到本地
+        - 拉取完成后更新 seq.block_table，后续 attention 全部走本地
+        """
+        # ------------------------------------------------ #
+        # 执行前：拉取所有标记的远程块到本地
+        # ------------------------------------------------ #
+        if self.gbm is not None:
+            for seq in seqs:
+                if hasattr(seq, 'pending_swap_in') and seq.pending_swap_in:
+                    self._swap_in_remote_blocks(seq)
+        # ------------------------------------------------ #
+
         if is_prefill:
             input_ids = self.prepare_prefill(seqs)
         else:
@@ -396,12 +430,10 @@ class ModelRunner:
         reset_context()
         return token_ids
 
-    # capture the CUDA graph:
-    # pre-allocation at maximum sizes: allocated onece and reuse for all graphs
-    # capture for different common batch sizes: [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-    # with torch.cuda.graph(graph, self.graph_pool):
-    #        run model() and exact sequence of CUDA kernels for running self.model() will be captured
-    # (later use graph.replay() to run the captured graph)
+    # ------------------------------------------------------------------
+    # CUDA graph 捕获
+    # ------------------------------------------------------------------
+
     @torch.inference_mode()
     def capture_cudagraph(self) -> None:
         max_bs = self.config['max_num_seqs']
@@ -456,3 +488,63 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+
+    # ------------------------------------------------------------------
+    # 远程块拉取
+    # ------------------------------------------------------------------
+
+    def _swap_in_remote_blocks(self, seq: Sequence):
+        """
+        将 seq.pending_swap_in 中的远程块拉取到本地，更新 block_table
+
+        流程：
+        1. 从 seq.remote_gpu_id 拉取远程 KV 数据
+        2. 写入本地空闲块
+        3. 更新 seq.block_table（远程块对应的位置替换为本地块 ID）
+        4. 清空 seq.pending_swap_in
+        """
+        from myvllm.engine.kv_transfer import swap_in
+
+        remote_blocks = seq.pending_swap_in
+        remote_gpu = seq.remote_gpu_id
+
+        if not remote_blocks or remote_gpu < 0:
+            seq.pending_swap_in = []
+            return
+
+        # 获取任意一层的 kv_cache 引用（所有层共享同一个 block 索引空间）
+        # k_cache 形状为 (max_cached_blocks, block_size, num_kv_heads, head_dim)
+        first_layer_kv = None
+        for module in self.model.modules():
+            if hasattr(module, 'k_cache'):
+                first_layer_kv = module.k_cache
+                break
+
+        if first_layer_kv is None:
+            raise RuntimeError("Cannot find k_cache in model layers for swap_in")
+
+        # 扩展为 (2, ...) 形状，swap_in 期望 kv_cache[:, block_id, ...]
+        # 实际上逐层传输，这里传引用即可
+        local_blocks = swap_in(
+            remote_gpu=remote_gpu,
+            remote_blocks=remote_blocks,
+            local_gpu=self.rank,
+            kv_cache=first_layer_kv,
+            num_layers=self.config['num_layers'],
+            block_size=self.block_size,
+            num_kv_heads=self.config['num_kv_heads'] // self.world_size,
+            head_dim=self.config['head_dim'] if 'head_dim' in self.config else self.config['hidden_size'] // self.config['num_heads'],
+        )
+
+        # 更新 block_table：把远程块对应的位置替换成本地块
+        # 假设 pending_swap_in 中的块顺序与 block_table 中前缀部分对应
+        for i, local_block in enumerate(local_blocks):
+            if i < len(seq.block_table):
+                seq.block_table[i] = local_block
+            else:
+                seq.block_table.append(local_block)
+
+        # 清除远程标记
+        seq.pending_swap_in = []
+        seq.is_remote_prefix = False
+        seq.remote_gpu_id = -1

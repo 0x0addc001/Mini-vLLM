@@ -36,6 +36,15 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.max_model_length = sampling_params.max_model_length
+        # ---------------------------------------------------- #
+        # 以下是全局 KV cache 池相关状态
+        # ---------------------------------------------------- #
+        # 是否使用了远程 GPU 上前缀的 KV cache
+        self.is_remote_prefix = False
+        # 远程前缀所在的 GPU rank，-1 表示所有块都在本地
+        self.remote_gpu_id = -1
+        # 等待从远端 swap_in 的块索引列表（远端 GPU 上的 physical block id）
+        self.pending_swap_in = []
 
     def __len__(self):
         return self.num_tokens
@@ -92,7 +101,13 @@ class Sequence:
             self.num_prompt_tokens, 
             self.num_cached_tokens, 
             self.block_table,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token
+            self.token_ids if self.num_completion_tokens == 0 else self.last_token,
+            # ---------------------------------------------------- #
+            # 全局 KV cache 池状态也需要序列化，以便广播到其他 rank
+            # ---------------------------------------------------- #
+            self.is_remote_prefix,
+            self.remote_gpu_id,
+            self.pending_swap_in,
         )
 
     def __setstate__(self, state):
@@ -101,7 +116,13 @@ class Sequence:
             self.num_prompt_tokens,
             self.num_cached_tokens,
             self.block_table,
-            last_token_or_ids
+            last_token_or_ids,
+            # ---------------------------------------------------- #
+            # 反序列化全局 KV cache 池状态
+            # ---------------------------------------------------- #
+            self.is_remote_prefix,
+            self.remote_gpu_id,
+            self.pending_swap_in,
         ) = state
         # Check if this is prefill (num_completion_tokens == 0) or decode phase
         num_completion_tokens = self.num_tokens - self.num_prompt_tokens
