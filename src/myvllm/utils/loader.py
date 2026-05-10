@@ -210,5 +210,12 @@ def load_weights_from_checkpoint(model: nn.Module, model_name_or_path: str):
             if len(no_mapping_skips) > 5:
                 print(f"  ... and {len(no_mapping_skips) - 5} more")
 
+    print(f"{'-'*80}")
+    print("[DEBUG] Detailed skipped parameters (first 15):")
+    error_skips = [s for s in skipped_params if "Error" in s[1]]
+    if error_skips:
+        print(f"⚠️ FAILED due to errors: {len(error_skips)}")
+        for name, reason in error_skips[:15]:
+            print(f"  - {name}: {reason}")
     print(f"{'='*80}")
     return loaded_params

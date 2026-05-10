@@ -101,7 +101,27 @@ class ModelRunner:
         # Load pretrained weights if model_name_or_path is provided
         if config.get('model_name_or_path'):
             from myvllm.utils.loader import load_weights_from_checkpoint
-            load_weights_from_checkpoint(self.model, config['model_name_or_path'])
+            # load_weights_from_checkpoint(self.model, config['model_name_or_path'])
+            # print(f"[Rank {rank}] Weight loading completed")
+
+            # ------------------------------------------ #
+            # 在分布式环境下进行权重加载和广播
+            # ------------------------------------------ #
+            if self.rank == 0:
+                # 只有 rank 0 从磁盘加载权重
+                load_weights_from_checkpoint(self.model, config['model_name_or_path'])
+                print(f"[Rank 0] Weight loading completed")
+            
+            if self.world_size > 1:
+                # 确保 rank 0 加载完成后，其他 rank 才能开始广播
+                dist.barrier()
+                print(f"[Rank {self.rank}] Passed barrier after weight loading") 
+                # 广播所有权重给其他 rank
+                for param in self.model.parameters():
+                    dist.broadcast(param.data, src=0)
+                dist.barrier()
+                if self.rank == 0:
+                    print(f"[Rank 0] Weight broadcast completed")
 
         # Load weights in CPU (move the model to GPU after loading weights)
         # self.model = self.model.cuda(rank)
