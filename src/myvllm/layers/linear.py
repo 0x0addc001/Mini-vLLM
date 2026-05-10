@@ -18,7 +18,10 @@ class LinearBase(nn.Module):
         # set tp_dim, tp_rank, tp_world_size for tensor parallelism
         self.tp_dim = tp_dim 
         self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+
+        # 暂时不用 TP
+        # self.tp_size = dist.get_world_size()
+        self.tp_size = 1
         
         # create weight parameter with custom weight loader
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
@@ -87,8 +90,10 @@ class ColumnParallelLinear(LinearBase):
         output_size: int,
         bias: bool = True,
     ):
-        tp_size = dist.get_world_size()
-        assert output_size % tp_size == 0, "Output size must be divisible by tensor parallel size."
+        # 暂时不用 TP
+        # tp_size = dist.get_world_size()
+        tp_size = 1
+        # assert output_size % tp_size == 0, "Output size must be divisible by tensor parallel size."
         super().__init__(input_size, output_size//tp_size, bias, tp_dim=0)
 
     # param: parameter after tensor parallelism
@@ -157,7 +162,9 @@ class QKVColumnParallelLinear(ColumnParallelLinear):
         num_kv_heads: int | None = None,
         bias: bool = False,
     ):
-        self.tp_size = dist.get_world_size()
+        # 暂时不用 TP
+        # self.tp_size = dist.get_world_size()
+        self.tp_size = 1
         num_kv_heads = num_kv_heads or num_heads
         self.head_size = head_size
         self.num_heads = num_heads // self.tp_size
@@ -202,7 +209,9 @@ class RowParallelLinear(LinearBase):
         output_size: int,
         bias: bool = True,
     ):
-        tp_size = dist.get_world_size()
+        # 暂时不用 TP
+        # tp_size = dist.get_world_size()
+        tp_size = 1
         assert input_size % tp_size == 0, "Input size must be divisible by tensor parallel size."
         super().__init__(input_size // tp_size, output_size, bias, tp_dim=1)
 

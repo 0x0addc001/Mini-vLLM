@@ -12,7 +12,10 @@ from myvllm.utils import get_context
 class VocabParallelEmbedding(nn.Module):
     def __init__(self, num_embeddings: int, embedding_dim: int):
         super().__init__()
-        self.tp_size = dist.get_world_size()
+
+        # 暂时不用 TP
+        # self.tp_size = dist.get_world_size()
+        self.tp_size = 1
         self.tp_rank = dist.get_rank()
 
         # keep the original num_embeddings

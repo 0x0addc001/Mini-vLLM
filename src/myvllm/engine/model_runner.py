@@ -249,7 +249,9 @@ class ModelRunner:
         available_mem = total_free_mem - (peak_mem_usage - current_mem_usage)
 
         num_layers = self.config['num_layers']
-        num_kv_heads = self.config['num_kv_heads'] // self.world_size
+        # 暂时不用 TP
+        # num_kv_heads = self.config['num_kv_heads'] // self.world_size
+        num_kv_heads = self.config['num_kv_heads']
         head_dim = self.config['head_dim'] if 'head_dim' in self.config else self.config['hidden_size'] // self.config['num_heads']
 
         # check whether the current free memory can hold at least one block
@@ -552,7 +554,9 @@ class ModelRunner:
             kv_cache=first_layer_kv,
             num_layers=self.config['num_layers'],
             block_size=self.block_size,
-            num_kv_heads=self.config['num_kv_heads'] // self.world_size,
+            # 暂时不用 TP
+            # num_kv_heads=self.config['num_kv_heads'], // self.world_size
+            num_kv_heads=self.config['num_kv_heads'],
             head_dim=self.config['head_dim'] if 'head_dim' in self.config else self.config['hidden_size'] // self.config['num_heads'],
         )
 

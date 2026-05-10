@@ -23,7 +23,7 @@ config = {
     'max_num_batched_tokens': 1024,
     'max_cached_blocks': 1024,
     'block_size': 256,
-    'world_size': 1,
+    # 'world_size': 1,
     'model_name_or_path': 'Qwen/Qwen3-0.6B',
     'enforce_eager': True,
     'vocab_size': 151936,  # Fixed: was 151643, HF model uses 151936
@@ -49,20 +49,23 @@ config = {
     # -------------------------------------------------------------------- #
     # 单卡：
     # CUDA_VISIBLE_DEVICES=0 uv run python main.py
-    'enable_global_pool': False,          # 关闭全局 KV cache 池
+    # 'world_size': 1,
+    # 'enable_global_pool': False,          # 关闭全局 KV cache 池
     # ---------------------------------------------------------------- #
     # 双卡：
     # CUDA_VISIBLE_DEVICES=0,2 uv run python main.py
-    # 'enable_global_pool': True,             # 启用全局 KV cache 池
-    # 'swap_threshold': 0.85,                 # GPU 显存使用率阈值，超此值触发 swap
-    # 'global_page_table_sync_interval': 10,  # 全局页表广播间隔（调度周期数）
-    # 'nvlink_topo': {                        # NVLink 拓扑信息
-    #     'pairs': [(0,1)],                   # NVLink 直连 GPU 对（重映射后逻辑ID）
-    #     'sockets': [[0,1]],                 # 同 CPU Socket 分组（重映射后逻辑ID）
-    # },
+    'world_size': 2,
+    'enable_global_pool': True,             # 启用全局 KV cache 池
+    'swap_threshold': 0.85,                 # GPU 显存使用率阈值，超此值触发 swap
+    'global_page_table_sync_interval': 10,  # 全局页表广播间隔（调度周期数）
+    'nvlink_topo': {                        # NVLink 拓扑信息
+        'pairs': [(0,1)],                   # NVLink 直连 GPU 对（重映射后逻辑ID）
+        'sockets': [[0,1]],                 # 同 CPU Socket 分组（重映射后逻辑ID）
+    },
     # ---------------------------------------------------------------- #
     # 八卡：
     # CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run python main.py
+    # 'world_size': 8,
     # 'enable_global_pool': True,             # 启用全局 KV cache 池
     # 'swap_threshold': 0.85,                 # GPU 显存使用率阈值，超此值触发 swap
     # 'global_page_table_sync_interval': 10,  # 全局页表广播间隔（调度周期数）

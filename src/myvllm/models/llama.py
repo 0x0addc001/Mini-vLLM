@@ -19,7 +19,9 @@ class LlamaAttn(nn.Module):
         block_size: int = 256,
     ):
         super().__init__()
-        self.tp_size = dist.get_world_size()
+        # 暂时不用 TP
+        # self.tp_size = dist.get_world_size()
+        self.tp_size = 1
 
         self.total_num_heads = num_qo_heads
         self.num_heads = num_qo_heads // self.tp_size
