@@ -62,14 +62,18 @@ class GlobalScheduler:
 
         if prefix_hash is None:
             # 没有完整的块前缀，选择空闲最多的 GPU
-            return self._select_most_free_gpu(rank, world_size)
+            target = self._select_most_free_gpu(rank, world_size)
+            print(f"[GlobalScheduler] seq {seq.seq_id}: no full blocks -> GPU {target} (most free)")
+            return target
 
         # 2. 查询全局前缀命中
         hits = self.gbm.lookup_prefix(prefix_hash)
 
         if not hits:
             # 没有命中任何 GPU，选择空闲最多的 GPU
-            return self._select_most_free_gpu(rank, world_size)
+            target = self._select_most_free_gpu(rank, world_size)
+            print(f"[GlobalScheduler] seq {seq.seq_id}: prefix hash={prefix_hash}, no hits -> GPU {target} (most free)")
+            return target
 
         # 3. 按 GPU 聚合命中块数
         gpu_hit_count: dict[int, int] = {}
@@ -98,15 +102,24 @@ class GlobalScheduler:
                 failed_gpus.append((gpu_id, score, hit_count))
 
         if best_score >= 0:
+            print(f"[GlobalScheduler] seq {seq.seq_id}: prefix hash={prefix_hash}, "
+              f"hits={gpu_hit_count}, best=GPU {best_gpu} (score={best_score:.1f}, "
+              f"free={self.gbm.get_free_blocks_count(best_gpu)}/{seq.num_blocks})")
             return best_gpu
 
-        # 5. 命中 GPU 空闲都不够 → 选择权重最高的，后续 rebalance 会腾空间
+        # 5. 命中 GPU 空闲都不够 -> 选择权重最高的，后续 rebalance 会腾空间
         if failed_gpus:
             failed_gpus.sort(key=lambda x: x[1], reverse=True)
-            return failed_gpus[0][0]
+            target = failed_gpus[0][0]
+            print(f"[GlobalScheduler] seq {seq.seq_id}: prefix hash={prefix_hash}, "
+                    f"all hit GPUs full, fallback=GPU {target} "
+                    f"(failed={[(g, s) for g, s, _ in failed_gpus]})")
+            return target
 
         # 6. 兜底：本地或空闲最多的 GPU
-        return self._select_most_free_gpu(rank, world_size)
+        target = self._select_most_free_gpu(rank, world_size)
+        print(f"[GlobalScheduler] seq {seq.seq_id}: fallback -> GPU {target} (most free)")
+        return target
 
     def _compute_prefix_hash(self, seq: Sequence) -> Optional[int]:
         """

@@ -431,6 +431,10 @@ class ModelRunner:
         - 如果有，调用 _swap_in_remote_blocks 拉取远端 KV 块到本地
         - 拉取完成后更新 seq.block_table，后续 attention 全部走本地
         """
+        if self.rank != 0:
+            return None
+        phase = "PREFILL" if is_prefill else "DECODE"
+        print(f"[Rank {self.rank}] {phase} | num_seqs={len(seqs)} | tokens={sum(len(s) for s in seqs) if is_prefill else len(seqs)}")
         # ------------------------------------------------ #
         # 执行前：拉取所有标记的远程块到本地
         # ------------------------------------------------ #
