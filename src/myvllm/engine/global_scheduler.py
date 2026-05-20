@@ -35,6 +35,9 @@ class GlobalScheduler:
         """
         self.gbm = gbm
         self.block_manager = block_manager
+        
+        # test
+        # self.cnt=0
 
     # ------------------------------------------------------------------
     # 请求路由
@@ -56,6 +59,11 @@ class GlobalScheduler:
         """
         rank = dist.get_rank()
         world_size = dist.get_world_size()
+
+        # test
+        # self.cnt+=1
+        # return self.cnt%2
+        print(f"[GlobalScheduler] Routing seq {seq.seq_id} (tokens={seq.num_tokens}, blocks={seq.num_blocks})")
 
         # 1. 计算前缀 hash
         prefix_hash = self._compute_prefix_hash(seq)
