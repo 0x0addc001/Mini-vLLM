@@ -61,7 +61,8 @@ class GlobalScheduler:
         
         # @test
         # 奇数 seq_id -> GPU 1，偶数 -> GPU 0
-        target = seq.seq_id % 2
+        # target = seq.seq_id % 2
+        target = 1
         print(f"[GlobalScheduler] seq {seq.seq_id}: no full blocks -> GPU {target} (most free)")
         return target
 

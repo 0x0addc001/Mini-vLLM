@@ -97,12 +97,18 @@ class Sequence:
 
     def __getstate__(self):
         return (
+            self.seq_id,
             self.block_size,
+            self.status,
             self.num_tokens, 
             self.num_prompt_tokens, 
             self.num_cached_tokens, 
             self.block_table,
             self.token_ids if self.num_completion_tokens == 0 else self.last_token,
+            self.temperature,
+            self.max_tokens,
+            self.ignore_eos,
+            self.max_model_length,
             # ---------------------------------------------------- #
             # 全局 KV cache 池状态也需要序列化，以便广播到其他 rank
             # ---------------------------------------------------- #
@@ -113,12 +119,18 @@ class Sequence:
 
     def __setstate__(self, state):
         (
+            self.seq_id,
             self.block_size,
+            self.status,
             self.num_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,
             self.block_table,
             last_token_or_ids,
+            self.temperature,
+            self.max_tokens,
+            self.ignore_eos,
+            self.max_model_length,
             # ---------------------------------------------------- #
             # 反序列化全局 KV cache 池状态
             # ---------------------------------------------------- #

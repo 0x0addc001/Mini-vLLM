@@ -38,7 +38,7 @@ class ModelRunner:
         self.enable_global_pool = config.get('enable_global_pool', False)
 
         self.rank = rank
-        dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)
+        dist.init_process_group('nccl', "tcp://localhost:12347", world_size=config['world_size'], rank=rank)
         torch.cuda.set_device(rank)
 
         # ----------------------------------------------- #
@@ -341,6 +341,14 @@ class ModelRunner:
             for i, seq in enumerate(seqs):
                 block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
                 block_tables.append(block_table)
+
+        # ==========
+        # print(f"[Rank {dist.get_rank()}] slot_mappings len={len(slot_mappings)}, block_table={[s.block_table for s in seqs]}")
+        print(f"[Rank {dist.get_rank()}] slot_mappings len={len(slot_mappings)}, "
+                f"seq[0].num_cached_tokens={seqs[0].num_cached_tokens}, "
+                f"block_table={[s.block_table for s in seqs]}")
+        # ==========
+
         input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
         slot_mapping_tensor = torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
 
@@ -451,6 +459,9 @@ class ModelRunner:
         else:
             input_ids = self.prepare_decode(seqs)
         logits = self.run_model(input_ids, is_prefill)
+
+        # clone 脱离 inference mode，让 sampler 可以 inplace 修改
+        logits = logits.clone()
         
         token_ids = None
 

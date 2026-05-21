@@ -57,6 +57,8 @@ class Scheduler:
             - scheduled_sequences: 本轮需要执行的序列列表
             - is_prefill: True 表示 prefill 阶段，False 表示 decode 阶段
         """
+        print(f"[Rank {dist.get_rank()}] schedule() entered, waiting={len(self.waiting)}, running={len(self.running)}")
+
         scheduled_sequences = []
         current_scheduled_tokens = 0
 
@@ -130,10 +132,11 @@ class Scheduler:
         # ================================================================
         while self.running:
             seq = self.running.popleft()
+            print(f"[Rank {dist.get_rank()}] decode: seq {seq.seq_id}, num_tokens={seq.num_tokens}")
 
             # 检查是否可以追加一个 token
             if not self.block_manager.can_append(seq):
-
+                print(f"[Rank {dist.get_rank()}] decode: can_append=False for seq {seq.seq_id}")
                 # ---------------------------------------------------- #
                 # 全局 rebalance：尝试腾出 1 个块
                 # ---------------------------------------------------- #
@@ -164,10 +167,12 @@ class Scheduler:
                 self.running.appendleft(seq)
                 break
 
+            print(f"[Rank {dist.get_rank()}] decode: appending seq {seq.seq_id}")
             # 追加一个 token
             self.block_manager.append(seq)
             scheduled_sequences.append(seq)
             current_scheduled_tokens += 1
+            print(f"[Rank {dist.get_rank()}] decode: appended seq {seq.seq_id}")
 
         # 把已调度的序列重新放回 running 队列末尾（保持轮转顺序）
         if scheduled_sequences:
@@ -177,6 +182,7 @@ class Scheduler:
         # if self.global_scheduler is not None:
         #     self.global_scheduler.gbm.maybe_sync()
 
+        print(f"[Rank {dist.get_rank()}] schedule() returning, scheduled={len(scheduled_sequences)}")
         return scheduled_sequences, False
 
 

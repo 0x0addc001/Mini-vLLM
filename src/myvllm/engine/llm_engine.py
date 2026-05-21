@@ -1,4 +1,6 @@
 import atexit
+import torch
+import torch
 import torch.distributed as dist
 import time
 import torch.multiprocessing as mp
@@ -57,24 +59,63 @@ def worker_process(config, rank, recv_queue: Queue, send_queue: Queue):
     #         scheduler.postprocess(scheduled, outputs)
 
     # 独立推理循环
+    was_idle = False
+    finished_sent = False
     while True:
         # 1. 接收 Rank 0 发来的序列
         try:
-            while True:
-                seq = recv_queue.get_nowait()
+            # while True:
+            #     seq = recv_queue.get_nowait()
+            #     scheduler.add_sequence(seq)
+            # msg = recv_queue.get_nowait()
+            # msg = recv_queue.get(timeout=0.1)  # 阻塞等待，避免空转
+            msg = recv_queue.get_nowait()
+            if msg.get("type") == "exit":
+                model_runner.exit()
+                break
+            if msg.get("type") == "sequence":
+                seq = msg["seq"]
+                print(f"[Rank {rank}] Received seq: type={type(seq)}, seq_id={getattr(seq, 'seq_id', 'MISSING')}, tokens={seq.token_ids[:10]}...")
                 scheduler.add_sequence(seq)
-        except:
+                # scheduler.add_sequence(msg["seq"])
+                was_idle = False
+                finished_sent = False  # 有新序列，重置
+        except Exception as e:
+            import time
+            time.sleep(0.1)
+            print(f"[Rank {rank}] recv exception: {e}")
             pass
 
         # 2. 调度
+        print(f"[Rank {rank}] Before schedule: waiting={len(scheduler.waiting)}, running={len(scheduler.running)}")
         scheduled, is_prefill = scheduler.schedule()
+        print(f"[Rank {rank}] After schedule: scheduled={len(scheduled)}, is_prefill={is_prefill}")
+        # scheduled, is_prefill = scheduler.schedule()
         if not scheduled:
             # 如果本地没有序列且没有外部输入，短暂空转
             if scheduler.is_finished() and recv_queue.empty():
-                # 通知 Rank 0 当前空闲
-                send_queue.put({"type": "idle", "rank": rank})
+                if not finished_sent:  # 只发一次 idle + finished
+                    # send_queue.put({"type": "finished", "data": []})  # 空的 finished 表示完成
+                    try:
+                        send_queue.put_nowait({"type": "finished", "data": []})
+                    except:
+                        pass
+                    finished_sent = True
+                if not was_idle: # 只在首次空闲时发
+                    print(f"[Rank {rank}] Sending idle, queue size={send_queue.qsize()}")
+                    # 通知 Rank 0 当前空闲
+                    # send_queue.put({"type": "idle", "rank": rank})
+                    try:
+                        send_queue.put_nowait({"type": "idle", "rank": rank})
+                    except:
+                        pass
+                    was_idle = True
+                    print(f"[Rank {rank}] Idle sent")
             continue
-
+        
+        was_idle = False  # 有活干了，重置
+        finished_sent = False
+        
         # 3. 分离本地和远程序列
         local_seqs = [s for s in scheduled if s.remote_gpu_id in (-1, rank)]
         remote_seqs = [s for s in scheduled if s.remote_gpu_id not in (-1, rank)]
@@ -86,10 +127,15 @@ def worker_process(config, rank, recv_queue: Queue, send_queue: Queue):
         # 5. 本地执行
         if local_seqs:
             outputs = model_runner.run(local_seqs, is_prefill)
+            # scheduler.postprocess(local_seqs, outputs)
+            print(f"[Rank {rank}] Before postprocess")
             scheduler.postprocess(local_seqs, outputs)
+            print(f"[Rank {rank}] After postprocess")
 
         # 6. 收集完成的序列，回传 Rank 0
-        finished = [(s.seq_id, s.completion_token_ids) for s in scheduled if s.is_finished]
+        # finished = [(s.seq_id, s.completion_token_ids) for s in scheduled if s.is_finished]
+        finished = [(s.seq_id, [t.item() if isinstance(t, torch.Tensor) else t for t in s.completion_token_ids])
+            for s in scheduled if s.is_finished]
         if finished:
             print(f"[Rank {rank}] Sending finished: {finished}")
             send_queue.put({"type": "finished", "data": finished})
@@ -114,6 +160,8 @@ class LLMEngine:
         self.recv_queues = {}   # rank -> Queue，用于接收其他 rank 的消息
         self.send_queues = {}   # rank -> Queue，用于向其他 rank 发送消息
 
+        self.remote_finished = set()
+
         # 1. 先启动所有 worker 进程（在 dist 初始化之前）
         if self.world_size > 1:
             for i in range(1, self.world_size):
@@ -123,7 +171,8 @@ class LLMEngine:
                 self.send_queues[i] = send_q
                 process = ctx.Process(
                     target=worker_process,
-                    args=(config, i, recv_q, send_q)
+                    # args=(config, i, recv_q, send_q)
+                    args=(config, i, send_q, recv_q)  # worker 从 send_q 接收，向 recv_q 发送
                 )
                 self.processes.append(process)
                 process.start()
@@ -218,6 +267,8 @@ class LLMEngine:
 
     def exit(self):
         # self.model_runner.call("exit")
+        for rank, q in self.send_queues.items():
+            q.put({"type": "exit"})
         self.model_runner.exit()
         del self.model_runner
         for process in self.processes:
@@ -242,7 +293,6 @@ class LLMEngine:
         # # 每一步开始前同步页表
         # if self.scheduler.global_scheduler is not None:
         #     self.scheduler.global_scheduler.gbm.maybe_sync()
-
         scheduled_sequences, is_prefill = self.scheduler.schedule()
         if not scheduled_sequences:
             return [], 0, is_prefill
@@ -295,6 +345,7 @@ class LLMEngine:
                     msg = q.get_nowait()
                     if msg.get("type") == "finished":
                         finished.extend(msg["data"])
+                        self.remote_finished.add(rank)  # 标记该 rank 已完成
             except:
                 pass
 
@@ -350,7 +401,9 @@ class LLMEngine:
         for prompt in prompts:
             self.add_prompt(prompt, sampling_params)
         generated_tokens = {}
-        while not self.scheduler.is_finished():
+        # while not self.scheduler.is_finished():
+        # 退出条件：本地空闲 + 所有远程 rank 都发回了 finished
+        while not (self.scheduler.is_finished() and len(self.remote_finished) == len(self.recv_queues)):
             start_t = time.time()
             outputs, num_processed_tokens, is_prefill = self.step()
             end_t = time.time()
@@ -358,7 +411,6 @@ class LLMEngine:
             phase = "prefilling" if is_prefill else "decoding"
             print(num_processed_tokens, 'number of processed tokens', num_processed_tokens/running_time, "tokens/sec during", phase)
             generated_tokens.update({seq_id: tokens for seq_id, tokens in outputs})
-
         generated_tokens = [generated_tokens[seq_id] for seq_id in sorted(generated_tokens.keys())]
         output = {'text': [self.tokenizer.decode(tokens) for tokens in generated_tokens], 'token_ids': generated_tokens}
         return output
