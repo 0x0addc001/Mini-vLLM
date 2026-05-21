@@ -2,6 +2,7 @@ import atexit
 import torch.distributed as dist
 import time
 import torch.multiprocessing as mp
+from multiprocessing import Queue
 
 from myvllm.engine.sequence import Sequence
 from myvllm.engine.scheduler import Scheduler
@@ -12,7 +13,8 @@ from myvllm.sampling_parameters import SamplingParams
 from transformers import AutoTokenizer
 
 
-def worker_process(config, rank, event):
+# def worker_process(config, rank, event):
+def worker_process(config, rank, recv_queue: Queue, send_queue: Queue):
     """Worker process function that initializes ModelRunner and enters loop."""
     # FIRST print before any other code
     import sys
@@ -20,8 +22,77 @@ def worker_process(config, rank, event):
     sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)  # Line buffering
     sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
 
-    model_runner = ModelRunner(config, rank, event)
-    model_runner.loop()
+    # model_runner = ModelRunner(config, rank, event)
+    # model_runner.loop()
+
+    # 创建 GlobalBlockManager（共享）
+    gbm = GlobalBlockManager(
+        rank=rank,
+        world_size=config['world_size'],
+        num_blocks_per_gpu=config['max_cached_blocks'],
+        nvlink_pairs=config.get('nvlink_topo', {}).get('pairs', []),
+        socket_groups=config.get('nvlink_topo', {}).get('sockets', []),
+    )
+    # model_runner = ModelRunner(config, rank, event, gbm)
+    model_runner = ModelRunner(config, rank, gbm)
+    scheduler = Scheduler(
+        max_num_sequences=config.get("max_num_sequences", 16),
+        max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
+        max_cached_blocks=config.get("max_cached_blocks", 1024),
+        block_size=config.get("block_size", 256),
+        eos=config.get("eos", 50256),
+        global_scheduler=GlobalScheduler(gbm=gbm, block_manager=None),
+    )
+    # scheduler.global_scheduler.block_manager = scheduler.block_manager
+    # # 进入独立推理循环
+    # while True:
+    #     # 从某个队列接收序列，或者由外部推送
+    #     seqs = receive_sequences()  # 需要实现
+    #     if seqs:
+    #         for seq in seqs:
+    #             scheduler.add_sequence(seq)
+    #     scheduled, is_prefill = scheduler.schedule()
+    #     if scheduled:
+    #         outputs = model_runner.run(scheduled, is_prefill)
+    #         scheduler.postprocess(scheduled, outputs)
+
+    # 独立推理循环
+    while True:
+        # 1. 接收 Rank 0 发来的序列
+        try:
+            while True:
+                seq = recv_queue.get_nowait()
+                scheduler.add_sequence(seq)
+        except:
+            pass
+
+        # 2. 调度
+        scheduled, is_prefill = scheduler.schedule()
+        if not scheduled:
+            # 如果本地没有序列且没有外部输入，短暂空转
+            if scheduler.is_finished() and recv_queue.empty():
+                # 通知 Rank 0 当前空闲
+                send_queue.put({"type": "idle", "rank": rank})
+            continue
+
+        # 3. 分离本地和远程序列
+        local_seqs = [s for s in scheduled if s.remote_gpu_id in (-1, rank)]
+        remote_seqs = [s for s in scheduled if s.remote_gpu_id not in (-1, rank)]
+
+        # 4. 发远程序列到目标 rank
+        for seq in remote_seqs:
+            send_queue.put({"type": "sequence", "target": seq.remote_gpu_id, "seq": seq})
+
+        # 5. 本地执行
+        if local_seqs:
+            outputs = model_runner.run(local_seqs, is_prefill)
+            scheduler.postprocess(local_seqs, outputs)
+
+        # 6. 收集完成的序列，回传 Rank 0
+        finished = [(s.seq_id, s.completion_token_ids) for s in scheduled if s.is_finished]
+        if finished:
+            print(f"[Rank {rank}] Sending finished: {finished}")
+            send_queue.put({"type": "finished", "data": finished})
 
 
 class LLMEngine:
@@ -30,70 +101,124 @@ class LLMEngine:
 
     职责：
     - 不亲自做路由决策或显存决策
-    - 按正确顺序调用 GlobalScheduler → Scheduler → ModelRunner
+    - 按正确顺序调用 GlobalScheduler -> Scheduler -> ModelRunner
     - 管理多 GPU worker 进程的生命周期
     """
 
     def __init__(self, config: dict):
         self.config = config
-        world_size = config.get("world_size", 1)
+        self.world_size = config.get("world_size", 1)
         ctx = mp.get_context("spawn")
+
         self.processes = []
-        self.events = []
-        for i in range(1, world_size):
-            event = ctx.Event()
-            process = ctx.Process(target=worker_process, args=(config, i, event))
-            self.events.append(event)
-            self.processes.append(process)
-            process.start()
+        self.recv_queues = {}   # rank -> Queue，用于接收其他 rank 的消息
+        self.send_queues = {}   # rank -> Queue，用于向其他 rank 发送消息
 
-        # start the engine only on the master thread with rank = 0
-        self.model_runner = ModelRunner(config, rank=0, event=self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.get("model_name_or_path", "gpt2"))
+        # 1. 先启动所有 worker 进程（在 dist 初始化之前）
+        if self.world_size > 1:
+            for i in range(1, self.world_size):
+                recv_q = ctx.Queue()
+                send_q = ctx.Queue()
+                self.recv_queues[i] = recv_q
+                self.send_queues[i] = send_q
+                process = ctx.Process(
+                    target=worker_process,
+                    args=(config, i, recv_q, send_q)
+                )
+                self.processes.append(process)
+                process.start()
+        # 2. 创建 ModelRunner（内部调 dist.init_process_group，所有 rank 同步）
+        self.model_runner = ModelRunner(config, rank=0, gbm=None)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            config.get("model_name_or_path", "gpt2")
+        )
+        # Rank 0 的 GlobalBlockManager
+        # gbm = GlobalBlockManager(
+        #     rank=0,
+        #     world_size=self.world_size,
+        #     num_blocks_per_gpu=config['max_cached_blocks'],
+        #     nvlink_pairs=config.get('nvlink_topo', {}).get('pairs', []),
+        #     socket_groups=config.get('nvlink_topo', {}).get('sockets', []),
+        # ) if config.get('enable_global_pool', False) else None
+        #  # 现在 dist 已经初始化了，可以创建 GBM
 
-        # ------------------------------------------------------------ #
-        # 初始化全局调度器（仅在启用全局池化时）
-        # ------------------------------------------------------------ #
-        self.enable_global_pool = config.get('enable_global_pool', False)
-        if self.enable_global_pool:
-            # GlobalBlockManager 已在 ModelRunner 中初始化，直接复用
-            gbm = self.model_runner.gbm
-            # GlobalScheduler 需要 BlockManager 的 compute_hash 接口
-            # 但 BlockManager 在 Scheduler 中——先创建临时引用，后面设置
-            self.global_scheduler = GlobalScheduler(
-                gbm=gbm,
-                block_manager=None,  # 暂时为空，下面补上
+        # 3. dist 已初始化，创建 GBM
+        gbm = None
+        if config.get('enable_global_pool', False):
+            gbm = GlobalBlockManager(
+                rank=0,
+                world_size=self.world_size,
+                num_blocks_per_gpu=config['max_cached_blocks'],
+                nvlink_pairs=config.get('nvlink_topo', {}).get('pairs', []),
+                socket_groups=config.get('nvlink_topo', {}).get('sockets', []),
             )
-        else:
-            self.global_scheduler = None
-        # ------------------------------------------------------------ #
+            # 把 GBM 回填到 ModelRunner
+            self.model_runner.gbm = gbm
 
-        # scheduler needs to init after model_runner: when world_size > 1,
-        # ModelRunner.__init__ calls dist.init_process_group() which is a
-        # collective barrier — rank-0 blocks until all worker ranks have joined.
-        # The scheduler should only be created after that rendezvous completes.
-        # When world_size == 1 there is no barrier and no real dependency.
+        # 4. 创建 Scheduler
         self.scheduler = Scheduler(
             max_num_sequences=config.get("max_num_sequences", 16),
             max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
             max_cached_blocks=config.get("max_cached_blocks", 1024),
             block_size=config.get("block_size", 256),
             eos=config.get("eos", 50256),
-            global_scheduler=self.global_scheduler,  # 传入全局调度器
+            global_scheduler=GlobalScheduler(gbm=gbm, block_manager=None) if gbm else None,
         )
-
-        # ------------------------------------------------------------ #
-        # 回填 GlobalScheduler 的 block_manager 引用
-        # ------------------------------------------------------------ #
-        if self.global_scheduler is not None:
-            self.global_scheduler.block_manager = self.scheduler.block_manager
-        # ------------------------------------------------------------ #
-
+        if gbm:
+            self.scheduler.global_scheduler.block_manager = self.scheduler.block_manager
         atexit.register(self.exit)
+
+        # self.events = []
+        # for i in range(1, world_size):
+        #     event = ctx.Event()
+        #     process = ctx.Process(target=worker_process, args=(config, i, event))
+        #     self.events.append(event)
+        #     self.processes.append(process)
+        #     process.start()
+        # # start the engine only on the master thread with rank = 0
+        # self.model_runner = ModelRunner(config, rank=0, event=self.events)
+        # self.tokenizer = AutoTokenizer.from_pretrained(config.get("model_name_or_path", "gpt2"))
+        # # ------------------------------------------------------------ #
+        # # 初始化全局调度器（仅在启用全局池化时）
+        # # ------------------------------------------------------------ #
+        # self.enable_global_pool = config.get('enable_global_pool', False)
+        # if self.enable_global_pool:
+        #     # GlobalBlockManager 已在 ModelRunner 中初始化，直接复用
+        #     gbm = self.model_runner.gbm
+        #     # GlobalScheduler 需要 BlockManager 的 compute_hash 接口
+        #     # 但 BlockManager 在 Scheduler 中——先创建临时引用，后面设置
+        #     self.global_scheduler = GlobalScheduler(
+        #         gbm=gbm,
+        #         block_manager=None,  # 暂时为空，下面补上
+        #     )
+        # else:
+        #     self.global_scheduler = None
+        # # ------------------------------------------------------------ #
+        # scheduler needs to init after model_runner: when world_size > 1,
+        # ModelRunner.__init__ calls dist.init_process_group() which is a
+        # collective barrier — rank-0 blocks until all worker ranks have joined.
+        # The scheduler should only be created after that rendezvous completes.
+        # When world_size == 1 there is no barrier and no real dependency.
+        # self.scheduler = Scheduler(
+        #     max_num_sequences=config.get("max_num_sequences", 16),
+        #     max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
+        #     max_cached_blocks=config.get("max_cached_blocks", 1024),
+        #     block_size=config.get("block_size", 256),
+        #     eos=config.get("eos", 50256),
+        #     global_scheduler=self.global_scheduler,  # 传入全局调度器
+        # )
+        # # ------------------------------------------------------------ #
+        # # 回填 GlobalScheduler 的 block_manager 引用
+        # # ------------------------------------------------------------ #
+        # if self.global_scheduler is not None:
+        #     self.global_scheduler.block_manager = self.scheduler.block_manager
+        # # ------------------------------------------------------------ #
+        # atexit.register(self.exit)
 
 
     def exit(self):
-        self.model_runner.call("exit")
+        # self.model_runner.call("exit")
+        self.model_runner.exit()
         del self.model_runner
         for process in self.processes:
             process.join()
@@ -107,28 +232,103 @@ class LLMEngine:
         推理
 
         流程：
-        1. Scheduler.schedule() → 选出一批序列（内部已调用 GlobalScheduler 做路由和 rebalance）
-        2. ModelRunner.run() → 执行模型 forward（内部已拉取远程块）
-        3. postprocess → 追加 token、检查停止条件
+        1. Scheduler.schedule() -> 选出一批序列（内部已调用 GlobalScheduler 做路由和 rebalance）
+        2. ModelRunner.run() -> 执行模型 forward（内部已拉取远程块）
+        3. postprocess -> 追加 token、检查停止条件
 
         返回:
             (outputs, num_processed_tokens, is_prefill)
         """
+        # # 每一步开始前同步页表
+        # if self.scheduler.global_scheduler is not None:
+        #     self.scheduler.global_scheduler.gbm.maybe_sync()
+
         scheduled_sequences, is_prefill = self.scheduler.schedule()
         if not scheduled_sequences:
             return [], 0, is_prefill
+        
         # run the model
-        outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
+        # outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
         # Move outputs to CPU and convert them to a list
-        if outputs is not None:
-            outputs = outputs.cpu().tolist()
-        # postprocess the outputs
-        self.scheduler.postprocess(scheduled_sequences, outputs)
+        # if outputs is not None:
+        #     outputs = outputs.cpu().tolist()
+        # ------------------------------------------------------------ #
+        # 按目标 GPU 拆分序列
+        # ------------------------------------------------------------ #
+        # local_seqs = []
+        # remote_seqs = []
+        # for seq in scheduled_sequences:
+        #     if seq.remote_gpu_id == -1 or seq.remote_gpu_id == 0:
+        #         local_seqs.append(seq)
+        #     else:
+        #         remote_seqs.append(seq)
+        # 分离本地和远程序列
+        local_seqs = [s for s in scheduled_sequences if s.remote_gpu_id in (-1, 0)]
+        remote_seqs = [s for s in scheduled_sequences if s.remote_gpu_id not in (-1, 0)]
+        
+         # 发远程序列
+        for seq in remote_seqs:
+            target = seq.remote_gpu_id
+            if target in self.send_queues:
+                self.send_queues[target].put({"type": "sequence", "seq": seq})
 
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_sequences if seq.is_finished]
-        num_processed_tokens = sum(len(seq) for seq in scheduled_sequences) if is_prefill else len(scheduled_sequences)
+        # # 本地执行
+        # if local_seqs:
+        #     outputs = self.model_runner.run(local_seqs, is_prefill)
+        #     self.scheduler.postprocess(local_seqs, outputs)
 
-        return outputs, num_processed_tokens, is_prefill
+        # 收集完成的序列
+        finished = []
+        # 本地执行
+        if local_seqs:
+            print(f"[Rank 0] Running local prefill...")
+            outputs = self.model_runner.run(local_seqs, is_prefill)
+            print(f"[Rank 0] Local prefill done, outputs={outputs}")
+            self.scheduler.postprocess(local_seqs, outputs)
+            # 本地完成的序列
+            finished.extend([(s.seq_id, s.completion_token_ids) for s in local_seqs if s.is_finished])
+        # 收集其他 rank 完成的序列
+        print(f"[Rank 0] Collecting finished from ranks {list(self.recv_queues.keys())}")
+        for rank, q in self.recv_queues.items():
+            try:
+                while True:
+                    msg = q.get_nowait()
+                    if msg.get("type") == "finished":
+                        finished.extend(msg["data"])
+            except:
+                pass
+
+        num_tokens = sum(len(s) for s in scheduled_sequences) if is_prefill else len(scheduled_sequences)
+        return finished, num_tokens, is_prefill
+        
+        # # Rank 0 执行本地序列
+        # local_outputs = None
+        # if local_seqs:
+        #     local_outputs = self.model_runner.call("run", local_seqs, is_prefill)
+        # # 把远程序列发给对应的 Rank
+        # remote_outputs = {}
+        # if remote_seqs and self.world_size > 1:
+        #     # 按目标 GPU 分组
+        #     groups: dict[int, list] = {}
+        #     for seq in remote_seqs:
+        #         groups.setdefault(seq.remote_gpu_id, []).append(seq)
+        #     for target_gpu, seqs_group in groups.items():
+        #         self.model_runner.call("run", seqs_group, is_prefill)  # Rank 1 通过 loop() 收到并执行
+        #         # 注意：Rank 1 的 run() 返回 None（不采样），这里需要额外机制取回 logits
+        #         # 暂时 Rank 1 只写 KV cache，采样仍在 Rank 0 做
+        #         remote_outputs[target_gpu] = None
+        # # 合并 outputs
+        # outputs = local_outputs  # Rank 1 的输出暂不取回，简化处理
+        # if outputs is not None:
+        #     outputs = outputs.cpu().tolist()
+        
+        # # postprocess the outputs
+        # self.scheduler.postprocess(scheduled_sequences, outputs)
+
+        # outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_sequences if seq.is_finished]
+        # num_processed_tokens = sum(len(seq) for seq in scheduled_sequences) if is_prefill else len(scheduled_sequences)
+
+        # return outputs, num_processed_tokens, is_prefill
 
 
     # add prompt string to the waiting queue by first transforming it to Sequence object
@@ -155,10 +355,8 @@ class LLMEngine:
             outputs, num_processed_tokens, is_prefill = self.step()
             end_t = time.time()
             running_time = end_t - start_t + 1e-10
-            if is_prefill:
-                print(num_processed_tokens, 'number of processed tokens', num_processed_tokens/running_time, "tokens/sec during prefilling")
-            else:
-                print(num_processed_tokens, 'number of processed tokens', num_processed_tokens/running_time, "tokens/sec during decoding")
+            phase = "prefilling" if is_prefill else "decoding"
+            print(num_processed_tokens, 'number of processed tokens', num_processed_tokens/running_time, "tokens/sec during", phase)
             generated_tokens.update({seq_id: tokens for seq_id, tokens in outputs})
 
         generated_tokens = [generated_tokens[seq_id] for seq_id in sorted(generated_tokens.keys())]

@@ -25,9 +25,11 @@ class ModelRunner:
     - 提供 kv_cache 张量引用给 kv_transfer 做实际数据传输
     """
 
-    def __init__(self, config: dict, rank: int, event: Event | list[Event]):
+    # def __init__(self, config: dict, rank: int, event: Event | list[Event], gbm: GlobalBlockManager = None):
+    def __init__(self, config: dict, rank: int, gbm: GlobalBlockManager = None):
+        
         self.config = config
-        self.event = event
+        # self.event = event
 
         # set distributed config
         self.block_size = config['block_size']
@@ -42,7 +44,9 @@ class ModelRunner:
         # ----------------------------------------------- #
         # 初始化 GlobalBlockManager（仅在启用全局池化时）
         # ----------------------------------------------- #
-        if self.enable_global_pool:
+        if gbm is not None:
+            self.gbm = gbm
+        elif self.enable_global_pool:
             self.gbm = GlobalBlockManager(
                 rank=rank,
                 world_size=self.world_size,
@@ -147,29 +151,29 @@ class ModelRunner:
 
         # IMPORTANT: Set up shared memory and barrier AFTER all model initialization
         # This ensures both ranks complete warmup/allocation before rank 1 enters its event loop
-        if self.world_size > 1:
-            # Synchronize before setting up shared memory
-            dist.barrier()
-            if self.rank == 0:
-                # Try to clean up existing shared memory first
-                try:
-                    old_shm = SharedMemory(name='myvllm')
-                    old_shm.close()
-                    old_shm.unlink()
-                except FileNotFoundError:
-                    pass
-                self.shm = SharedMemory(name='myvllm', create=True, size=2**20)
-                # Barrier to ensure rank 1 waits until shared memory is created
-                dist.barrier()
-            else:
-                # Wait for rank 0 to create shared memory
-                dist.barrier()
-                self.shm = SharedMemory(name='myvllm')
+        # if self.world_size > 1:
+        #     # Synchronize before setting up shared memory
+        #     dist.barrier()
+        #     if self.rank == 0:
+        #         # Try to clean up existing shared memory first
+        #         try:
+        #             old_shm = SharedMemory(name='myvllm')
+        #             old_shm.close()
+        #             old_shm.unlink()
+        #         except FileNotFoundError:
+        #             pass
+        #         self.shm = SharedMemory(name='myvllm', create=True, size=2**20)
+        #         # Barrier to ensure rank 1 waits until shared memory is created
+        #         dist.barrier()
+        #     else:
+        #         # Wait for rank 0 to create shared memory
+        #         dist.barrier()
+        #         self.shm = SharedMemory(name='myvllm')
 
     # ------------------------------------------------------------------
     # 共享内存读写
     # ------------------------------------------------------------------
-
+    '''
     def read_shm(self):
         assert self.world_size > 1 and self.rank != 0, "read_shm can only be called when world_size > 1 and rank != 0"
         self.event.wait()
@@ -223,7 +227,7 @@ class ModelRunner:
         if method:
             return method(*args)
         raise ValueError(f"Unknown method: {method_name}")
-
+    '''
     # ------------------------------------------------------------------
     # 预热 & KV cache 分配
     # ------------------------------------------------------------------
@@ -447,11 +451,16 @@ class ModelRunner:
         else:
             input_ids = self.prepare_decode(seqs)
         logits = self.run_model(input_ids, is_prefill)
-        # only sample when rank == 0
+        
         token_ids = None
-        if self.rank == 0:
-            token_ids = self.sampler(logits, self.prepare_sample(seqs))
+
+        # only sample when rank == 0
+        # if self.rank == 0:
+        #     token_ids = self.sampler(logits, self.prepare_sample(seqs))
+        # 所有 rank 都采样
+        token_ids = self.sampler(logits, self.prepare_sample(seqs))
         reset_context()
+        print(f"[Rank {self.rank}] run() finished, token_ids={token_ids[:5] if token_ids is not None else None}...")
         return token_ids
 
     # ------------------------------------------------------------------
@@ -574,3 +583,14 @@ class ModelRunner:
         seq.pending_swap_in = []
         seq.is_remote_prefix = False
         seq.remote_gpu_id = -1
+    
+    # ------------------------------------------------------------------
+    # 退出
+    # ------------------------------------------------------------------
+    def exit(self):
+        if not self.enforce_eager:
+            del self.graphs
+            del self.graph_vars
+        torch.cuda.synchronize()
+        if dist.is_initialized():
+            dist.destroy_process_group()

@@ -92,9 +92,9 @@ class ColumnParallelLinear(LinearBase):
     ):
         # 暂时不用 TP
         # tp_size = dist.get_world_size()
-        tp_size = 1
+        self.tp_size = 1
         # assert output_size % tp_size == 0, "Output size must be divisible by tensor parallel size."
-        super().__init__(input_size, output_size//tp_size, bias, tp_dim=0)
+        super().__init__(input_size, output_size//self.tp_size, bias, tp_dim=0)
 
     # param: parameter after tensor parallelism
     # loaded_weights: the original full parameter to be loaded into param
@@ -211,9 +211,9 @@ class RowParallelLinear(LinearBase):
     ):
         # 暂时不用 TP
         # tp_size = dist.get_world_size()
-        tp_size = 1
-        assert input_size % tp_size == 0, "Input size must be divisible by tensor parallel size."
-        super().__init__(input_size // tp_size, output_size, bias, tp_dim=1)
+        self.tp_size = 1
+        assert input_size % self.tp_size == 0, "Input size must be divisible by tensor parallel size."
+        super().__init__(input_size // self.tp_size, output_size, bias, tp_dim=1)
 
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
         param_data = param.data 

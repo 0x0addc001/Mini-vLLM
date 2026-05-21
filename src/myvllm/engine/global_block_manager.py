@@ -104,7 +104,10 @@ class GlobalBlockManager:
 
         # ---------- 管理节点心跳 ----------
         self.master_heartbeat: float = time.time()
-        self.heartbeat_timeout: float = 30.0  # 心跳超时（秒），超时后触发管理节点迁移
+        self.heartbeat_timeout: float = 100.0  # 心跳超时（秒），超时后触发管理节点迁移
+
+        # if self.is_master:
+        #     self.broadcast_page_table()  # 初始化时就同步一次，让所有 rank 拿到一致的状态
 
     # ------------------------------------------------------------------
     # 管理节点故障迁移
@@ -121,7 +124,7 @@ class GlobalBlockManager:
             self.master_heartbeat = time.time()
             return True
 
-        # 非 master 节点检查心跳
+        # 非 master 节点检查心跳，所有 rank 都参与广播
         try:
             heartbeat = self._broadcast_master_heartbeat()
             if time.time() - heartbeat > self.heartbeat_timeout:
@@ -165,11 +168,32 @@ class GlobalBlockManager:
     # 全局页表同步
     # ------------------------------------------------------------------
 
+    def gather_local_state(self):
+        """
+        收集所有 rank 的空闲块数到 self.free_blocks_per_gpu。
+        由 master_rank 在 broadcast_page_table 之前调用。
+        """
+        if self.world_size == 1:
+            return
+
+        local_free = torch.tensor(
+            [self.free_blocks_per_gpu[self.rank]],
+            dtype=torch.int64,
+            device=f'cuda:{self.rank}'
+        )
+        all_free = torch.zeros(self.world_size, dtype=torch.int64, device=f'cuda:{self.rank}')
+        dist.all_gather_into_tensor(all_free, local_free)
+
+        if self.is_master:
+            for i in range(self.world_size):
+                self.free_blocks_per_gpu[i] = all_free[i].item()
+
     def broadcast_page_table(self):
         """
-        管理节点将全局页表广播到所有 GPU
-        只在管理节点上调用有效，其他节点接收并更新本地缓存
+        管理节点将全局页表广播到所有 GPU,，其他节点接收并更新本地缓存
+        广播前先收集所有 rank 的最新空闲块状态
         """
+        self.gather_local_state()
         data = (
             self.global_page_table,
             self.free_blocks_per_gpu,
@@ -197,7 +221,7 @@ class GlobalBlockManager:
         """周期性检查是否需要同步页表"""
         self._sync_counter += 1
         if self._sync_counter % self.sync_interval == 0:
-            self.check_master_health()
+            # self.check_master_health() # 暂时禁用故障检测，只做页表广播
             if self.is_master:
                 self.broadcast_page_table()
 

@@ -57,7 +57,8 @@ class VocabParallelEmbedding(nn.Module):
         x = mask * (x - self.tp_rank * self.num_embeddings_per_partition)
         output = F.embedding(x, self.weight)
 
-        if dist.get_world_size() > 1:
+        # if dist.get_world_size() > 1:
+        if self.tp_size > 1:
             # need to mask again, otherwise the embedding for the out-of-range ids will be the embedding of id 0
             output = mask.unsqueeze(1) * output
             dist.all_reduce(output, op=dist.ReduceOp.SUM)

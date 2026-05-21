@@ -75,12 +75,18 @@ class Scheduler:
 
                 # 如果序列路由到其他 GPU，从本地 waiting 移除并发送过去
                 if target_gpu != self.rank:
-                    self.waiting.popleft()
-                    # 标记为远程前缀（如果命中了远程块）
-                    if seq.remote_gpu_id != -1:
-                        seq.is_remote_prefix = True
-                    # 发送到目标 GPU（通过外部队列，这里只标记）
-                    # 实际发送逻辑在 LLMEngine 中处理
+                    # self.waiting.popleft()
+                    # # 标记为远程前缀（如果命中了远程块）
+                    # if seq.remote_gpu_id != -1:
+                    #     seq.is_remote_prefix = True
+                    # # 发送到目标 GPU（通过外部队列，这里只标记）
+                    # # 实际发送逻辑在 LLMEngine 中处理
+                    # continue
+                    seq = self.waiting.popleft()
+                    seq.status = SequenceStatus.RUNNING
+                    scheduled_sequences.append(seq)       # 保留在调度列表里
+                    current_scheduled_tokens += len(seq)
+                    # 不在这里分配 block，由目标 rank 自己分配
                     continue
             # -------------------------------------------------------- #
 
@@ -114,6 +120,9 @@ class Scheduler:
             scheduled_sequences.append(seq)
 
         if scheduled_sequences:
+            # # 周期性同步全局页表
+            # if self.global_scheduler is not None:
+            #     self.global_scheduler.gbm.maybe_sync()
             return scheduled_sequences, True
 
         # ================================================================
@@ -163,6 +172,10 @@ class Scheduler:
         # 把已调度的序列重新放回 running 队列末尾（保持轮转顺序）
         if scheduled_sequences:
             self.running.extendleft(reversed(scheduled_sequences))
+
+        # # 周期性同步全局页表
+        # if self.global_scheduler is not None:
+        #     self.global_scheduler.gbm.maybe_sync()
 
         return scheduled_sequences, False
 
