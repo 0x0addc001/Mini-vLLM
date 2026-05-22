@@ -17,10 +17,10 @@ class LinearBase(nn.Module):
         super().__init__()
         # set tp_dim, tp_rank, tp_world_size for tensor parallelism
         self.tp_dim = tp_dim 
-        self.tp_rank = dist.get_rank()
-
-        # 暂时不用 TP
+        # 暂时不用 TP。每个 rank 都复制完整权重，TP rank 固定为 0。
+        # self.tp_rank = dist.get_rank()
         # self.tp_size = dist.get_world_size()
+        self.tp_rank = 0
         self.tp_size = 1
         
         # create weight parameter with custom weight loader

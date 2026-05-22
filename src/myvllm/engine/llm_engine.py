@@ -15,6 +15,10 @@ from myvllm.sampling_parameters import SamplingParams
 from transformers import AutoTokenizer
 
 
+def _as_token_list(tokens):
+    return [t.item() if isinstance(t, torch.Tensor) else t for t in tokens]
+
+
 # def worker_process(config, rank, event):
 def worker_process(config, rank, recv_queue: Queue, send_queue: Queue):
     """Worker process function that initializes ModelRunner and enters loop."""
@@ -60,30 +64,25 @@ def worker_process(config, rank, recv_queue: Queue, send_queue: Queue):
 
     # 独立推理循环
     was_idle = False
-    finished_sent = False
     while True:
         # 1. 接收 Rank 0 发来的序列
+        received_any = False
         try:
-            # while True:
-            #     seq = recv_queue.get_nowait()
-            #     scheduler.add_sequence(seq)
-            # msg = recv_queue.get_nowait()
-            # msg = recv_queue.get(timeout=0.1)  # 阻塞等待，避免空转
-            msg = recv_queue.get_nowait()
-            if msg.get("type") == "exit":
-                model_runner.exit()
-                break
-            if msg.get("type") == "sequence":
-                seq = msg["seq"]
-                print(f"[Rank {rank}] Received seq: type={type(seq)}, seq_id={getattr(seq, 'seq_id', 'MISSING')}, tokens={seq.token_ids[:10]}...")
-                scheduler.add_sequence(seq)
-                # scheduler.add_sequence(msg["seq"])
-                was_idle = False
-                finished_sent = False  # 有新序列，重置
+            while True:
+                msg = recv_queue.get_nowait()
+                received_any = True
+                if msg.get("type") == "exit":
+                    model_runner.exit()
+                    return
+                if msg.get("type") == "sequence":
+                    seq = msg["seq"]
+                    print(f"[Rank {rank}] Received seq: type={type(seq)}, seq_id={getattr(seq, 'seq_id', 'MISSING')}, tokens={seq.token_ids[:10]}...")
+                    scheduler.add_sequence(seq)
+                    # scheduler.add_sequence(msg["seq"])
+                    was_idle = False
         except Exception as e:
-            import time
-            time.sleep(0.1)
-            print(f"[Rank {rank}] recv exception: {e}")
+            if received_any:
+                print(f"[Rank {rank}] recv drained: {e}")
             pass
 
         # 2. 调度
@@ -94,13 +93,6 @@ def worker_process(config, rank, recv_queue: Queue, send_queue: Queue):
         if not scheduled:
             # 如果本地没有序列且没有外部输入，短暂空转
             if scheduler.is_finished() and recv_queue.empty():
-                if not finished_sent:  # 只发一次 idle + finished
-                    # send_queue.put({"type": "finished", "data": []})  # 空的 finished 表示完成
-                    try:
-                        send_queue.put_nowait({"type": "finished", "data": []})
-                    except:
-                        pass
-                    finished_sent = True
                 if not was_idle: # 只在首次空闲时发
                     print(f"[Rank {rank}] Sending idle, queue size={send_queue.qsize()}")
                     # 通知 Rank 0 当前空闲
@@ -111,10 +103,10 @@ def worker_process(config, rank, recv_queue: Queue, send_queue: Queue):
                         pass
                     was_idle = True
                     print(f"[Rank {rank}] Idle sent")
+                time.sleep(0.01)
             continue
         
         was_idle = False  # 有活干了，重置
-        finished_sent = False
         
         # 3. 分离本地和远程序列
         local_seqs = [s for s in scheduled if s.remote_gpu_id in (-1, rank)]
@@ -134,7 +126,7 @@ def worker_process(config, rank, recv_queue: Queue, send_queue: Queue):
 
         # 6. 收集完成的序列，回传 Rank 0
         # finished = [(s.seq_id, s.completion_token_ids) for s in scheduled if s.is_finished]
-        finished = [(s.seq_id, [t.item() if isinstance(t, torch.Tensor) else t for t in s.completion_token_ids])
+        finished = [(s.seq_id, _as_token_list(s.completion_token_ids))
             for s in scheduled if s.is_finished]
         if finished:
             print(f"[Rank {rank}] Sending finished: {finished}")
@@ -161,6 +153,7 @@ class LLMEngine:
         self.send_queues = {}   # rank -> Queue，用于向其他 rank 发送消息
 
         self.remote_finished = set()
+        self.remote_inflight_seq_ids = set()
 
         # 1. 先启动所有 worker 进程（在 dist 初始化之前）
         if self.world_size > 1:
@@ -278,6 +271,23 @@ class LLMEngine:
     # return scheduled sequences and whether it is for prefilling
     # call model_runner.run() to run the model
     # call postprocessor to process the outputs and update sequences and update block manager
+    def _drain_worker_messages(self) -> list[tuple[int, list[int]]]:
+        finished = []
+        for rank, q in self.recv_queues.items():
+            try:
+                while True:
+                    msg = q.get_nowait()
+                    msg_type = msg.get("type")
+                    if msg_type == "finished":
+                        for seq_id, tokens in msg["data"]:
+                            finished.append((seq_id, tokens))
+                            self.remote_inflight_seq_ids.discard(seq_id)
+                    elif msg_type == "idle":
+                        self.remote_finished.add(rank)
+            except:
+                pass
+        return finished
+
     def step(self) -> tuple[list[int], bool]:
         """
         推理
@@ -294,8 +304,11 @@ class LLMEngine:
         # if self.scheduler.global_scheduler is not None:
         #     self.scheduler.global_scheduler.gbm.maybe_sync()
         scheduled_sequences, is_prefill = self.scheduler.schedule()
+        finished = self._drain_worker_messages()
         if not scheduled_sequences:
-            return [], 0, is_prefill
+            if not finished:
+                time.sleep(0.01)
+            return finished, 0, is_prefill
         
         # run the model
         # outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
@@ -321,14 +334,14 @@ class LLMEngine:
             target = seq.remote_gpu_id
             if target in self.send_queues:
                 self.send_queues[target].put({"type": "sequence", "seq": seq})
+                self.remote_inflight_seq_ids.add(seq.seq_id)
+                self.remote_finished.discard(target)
 
         # # 本地执行
         # if local_seqs:
         #     outputs = self.model_runner.run(local_seqs, is_prefill)
         #     self.scheduler.postprocess(local_seqs, outputs)
 
-        # 收集完成的序列
-        finished = []
         # 本地执行
         if local_seqs:
             print(f"[Rank 0] Running local prefill...")
@@ -336,18 +349,10 @@ class LLMEngine:
             print(f"[Rank 0] Local prefill done, outputs={outputs}")
             self.scheduler.postprocess(local_seqs, outputs)
             # 本地完成的序列
-            finished.extend([(s.seq_id, s.completion_token_ids) for s in local_seqs if s.is_finished])
+            finished.extend([(s.seq_id, _as_token_list(s.completion_token_ids)) for s in local_seqs if s.is_finished])
         # 收集其他 rank 完成的序列
         print(f"[Rank 0] Collecting finished from ranks {list(self.recv_queues.keys())}")
-        for rank, q in self.recv_queues.items():
-            try:
-                while True:
-                    msg = q.get_nowait()
-                    if msg.get("type") == "finished":
-                        finished.extend(msg["data"])
-                        self.remote_finished.add(rank)  # 标记该 rank 已完成
-            except:
-                pass
+        finished.extend(self._drain_worker_messages())
 
         num_tokens = sum(len(s) for s in scheduled_sequences) if is_prefill else len(scheduled_sequences)
         return finished, num_tokens, is_prefill
@@ -403,9 +408,19 @@ class LLMEngine:
         generated_tokens = {}
         # while not self.scheduler.is_finished():
         # 退出条件：本地空闲 + 所有远程 rank 都发回了 finished
-        while not (self.scheduler.is_finished() and len(self.remote_finished) == len(self.recv_queues)):
+        expected_num_outputs = len(prompts)
+        while len(generated_tokens) < expected_num_outputs:
             start_t = time.time()
-            outputs, num_processed_tokens, is_prefill = self.step()
+            # outputs, num_processed_tokens, is_prefill = self.step()
+            try:
+                outputs, num_processed_tokens, is_prefill = self.step()
+            except Exception as e:
+                import traceback
+                print(f"\n[Rank {self.rank}] ====== Engine step error ======")
+                traceback.print_exc()
+                print(f"[Rank {self.rank}] ===============================\n")
+                # 发生异常时，由于无法获取本轮数据，为了防止后续代码因变量未定义报错，这里直接中断或跳过
+                break
             end_t = time.time()
             running_time = end_t - start_t + 1e-10
             phase = "prefilling" if is_prefill else "decoding"

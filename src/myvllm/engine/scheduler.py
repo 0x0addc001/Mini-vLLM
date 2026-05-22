@@ -37,7 +37,7 @@ class Scheduler:
         # 全局调度器接口
         # --------------------------------------------- #
         self.global_scheduler = global_scheduler
-
+        
         # 当前 rank（用于路由判断）
         self.rank = dist.get_rank() if dist.is_initialized() else 0
 
@@ -220,3 +220,11 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+
+            if seq.status == SequenceStatus.FINISHED:
+                self.block_manager.deallocate(seq)
+            elif seq.status == SequenceStatus.WAITING:
+                # 进到这里说明该序列顺利完成了推理，且没有触发 FINISHED 结束条件
+                # 意味着它刚刚完成了 Prefill 阶段，现在需要强制进入 Decode 状态
+                seq.status = SequenceStatus.RUNNING
+                self.running.append(seq)  # 塞进 running 队列，供下一轮 schedule() 挑出来做 DECODE

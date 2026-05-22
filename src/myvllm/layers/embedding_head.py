@@ -13,10 +13,12 @@ class VocabParallelEmbedding(nn.Module):
     def __init__(self, num_embeddings: int, embedding_dim: int):
         super().__init__()
 
-        # 暂时不用 TP
+        # 暂时不用 TP。每个 rank 都持有完整权重，因此 TP rank 必须固定为 0；
+        # 否则非 0 rank 会把完整 vocab 当成自己的远端 shard，导致输入 token 全被 mask。
         # self.tp_size = dist.get_world_size()
+        # self.tp_rank = dist.get_rank()
         self.tp_size = 1
-        self.tp_rank = dist.get_rank()
+        self.tp_rank = 0
 
         # keep the original num_embeddings
         self.num_embeddings = num_embeddings
