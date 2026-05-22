@@ -41,7 +41,8 @@ config = {
     'max_position': 32768, # should be >= max_model_length, max position index allowed in rotary embedding
     'ffn_bias': False,  # Fixed: HF Qwen3 doesn't use MLP bias
     'max_num_batch_tokens': 4096,
-    'max_model_length': 128,
+    # 'max_model_length': 128,
+    'max_model_length': 4096,
     'gpu_memory_utilization': 0.9,
     'eos': 151645,  # Fixed: should match tokenizer.eos_token_id
     'log_level': 'INFO',
@@ -88,7 +89,8 @@ def main():
     # max_tokens is the max number of generated tokens
     # max_model_length is the max total length including prompt
     # both should be set in SamplingParams and help to determine when to stop generation
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=256, max_model_length=128)
+    # sampling_params = SamplingParams(temperature=0.6, max_tokens=256, max_model_length=128)
+    sampling_params = SamplingParams(temperature=0.6, max_tokens=2048, max_model_length=4096)
     prompts = [
         "introduce yourself",# * 15,
         "list all prime numbers within 100",# * 15,

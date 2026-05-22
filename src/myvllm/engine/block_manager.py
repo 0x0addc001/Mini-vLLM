@@ -52,6 +52,10 @@ class BlockManager:
         h = xxhash.xxh64()
         if prefix_hash_value != -1:
             h.update(prefix_hash_value.to_bytes(8, 'little'))
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.cpu().tolist()
+        elif isinstance(token_ids, (list, tuple)):
+            token_ids = [t.item() if isinstance(t, torch.Tensor) else t for t in token_ids]
         h.update(np.array(token_ids, dtype=np.int32).tobytes())
         return h.intdigest()
 
@@ -139,8 +143,13 @@ class BlockManager:
 
         # if the last block is now full, compute hash
         if seq.num_tokens % self.block_size == 0:
+            token_ids=seq.block(seq.num_blocks - 1)
+
+            if isinstance(token_ids, torch.Tensor):
+                token_ids = token_ids.tolist()  # 转成 Python list
+
             h = self.compute_hash(
-                token_ids=seq.block(seq.num_blocks - 1),
+                token_ids=token_ids,
                 prefix_hash_value=-1 if len(block_tables) == 1 else self.blocks[block_tables[-2]].hash
             )
             block = self.blocks[last_block_for_seq_id]

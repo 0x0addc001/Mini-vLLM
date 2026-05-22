@@ -457,7 +457,7 @@ class LLMEngine:
                 outputs, num_processed_tokens, is_prefill = self.step()
             except Exception as e:
                 import traceback
-                logger.error("rank %s engine step error", self.rank)
+                logger.error("rank 0 engine step error")
                 traceback.print_exc()
                 # 发生异常时，由于无法获取本轮数据，为了防止后续代码因变量未定义报错，这里直接中断或跳过
                 break
