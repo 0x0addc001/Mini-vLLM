@@ -71,14 +71,14 @@ def worker_process(config, rank, recv_queue: Queue, send_queue: Queue):
         max_cached_blocks=config.get("max_cached_blocks", 1024),
         block_size=config.get("block_size", 256),
         eos=config.get("eos", 50256),
-        global_scheduler=GlobalScheduler(gbm=gbm, block_manager=None),
+        global_scheduler=GlobalScheduler(gbm=gbm, block_manager=None, model_runner=model_runner),
     )
 
     def handle_message(msg) -> bool:
         if msg.get("type") == "exit":
             model_runner.exit()
             return False
-        if msg.get("type") == "sequence":
+        elif msg.get("type") == "sequence":
             seq = msg["seq"]
             scheduler.add_sequence(seq)
             return True
@@ -224,7 +224,7 @@ class LLMEngine:
             max_cached_blocks=config.get("max_cached_blocks", 1024),
             block_size=config.get("block_size", 256),
             eos=config.get("eos", 50256),
-            global_scheduler=GlobalScheduler(gbm=gbm, block_manager=None) if gbm else None,
+            global_scheduler=GlobalScheduler(gbm=gbm, block_manager=None, model_runner=self.model_runner) if gbm else None,
         )
         if gbm:
             self.scheduler.global_scheduler.block_manager = self.scheduler.block_manager

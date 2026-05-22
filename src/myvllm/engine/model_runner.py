@@ -630,6 +630,72 @@ class ModelRunner:
         seq.pending_swap_in = []
         seq.is_remote_prefix = False
         seq.remote_gpu_id = -1
+
+    def execute_swap_out(
+        self,
+        blocks: List[int],
+        target_gpu: int,
+    ):
+        """
+        执行 swap_out：将本地 blocks 的数据搬移到 target_gpu
+        在源 GPU 上执行 swap_out
+        直接调用 kv_transfer 的 send 逻辑
+        """
+        from myvllm.engine.kv_transfer import swap_out
+        
+        # 找到 kv_cache 引用
+        kv_cache = self._get_kv_cache()
+        
+        logger.info(f"execute_swap_out: GPU{self.rank} → GPU{target_gpu} | blocks={blocks}")
+        target_blocks = swap_out(
+            local_gpu=self.rank,
+            blocks_to_evict=blocks,
+            target_gpu=target_gpu,
+            kv_cache=kv_cache,
+            num_layers=self.config['num_layers'],
+            block_size=self.block_size,
+            num_kv_heads=self.config['num_kv_heads'],
+            head_dim=self.config['head_dim'] if 'head_dim' in self.config 
+                     else self.config['hidden_size'] // self.config['num_heads'],
+        )
+        logger.info(f"execute_swap_out done: blocks={blocks} → target_blocks={target_blocks}")
+        return target_blocks
+
+    def execute_swap_in(
+        self,
+        remote_gpu: int,
+        remote_blocks: List[int],
+    ):
+        """
+        执行 swap_in：从 remote_gpu 拉取 blocks 到本地
+        在目标 GPU 上接收 swap_out 的数据
+        """
+        from myvllm.engine.kv_transfer import swap_in
+        
+        kv_cache = self._get_kv_cache()
+        
+        logger.info(f"execute_swap_in: GPU{remote_gpu} → GPU{self.rank} | blocks={remote_blocks}")
+        local_blocks = swap_in(
+            remote_gpu=remote_gpu,
+            remote_blocks=remote_blocks,
+            local_gpu=self.rank,
+            kv_cache=kv_cache,
+            num_layers=self.config['num_layers'],
+            block_size=self.block_size,
+            num_kv_heads=self.config['num_kv_heads'],
+            head_dim=self.config['head_dim'] if 'head_dim' in self.config 
+                     else self.config['hidden_size'] // self.config['num_heads'],
+        )
+        logger.info(f"execute_swap_in done: remote_blocks={remote_blocks} → local_blocks={local_blocks}")
+        return local_blocks
+
+    def _get_kv_cache(self):
+        """获取任意一层的 kv_cache 引用"""
+        for module in self.model.modules():
+            if hasattr(module, 'k_cache'):
+                return module.k_cache
+        raise RuntimeError("Cannot find k_cache in model layers")
+
     
     # ------------------------------------------------------------------
     # 退出

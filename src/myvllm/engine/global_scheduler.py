@@ -30,14 +30,16 @@ class GlobalScheduler:
     - preempt_for_swap: 当 rebalance 失败时，选择序列回退
     """
 
-    def __init__(self, gbm, block_manager):
+    def __init__(self, gbm, block_manager, model_runner=None):
         """
         参数:
             gbm: GlobalBlockManager 实例（维护全局页表）
             block_manager: 本地 BlockManager 实例（提供 compute_hash 等接口）
+            model_runner: ModelRunner 实例（提供 kv_cache 张量引用）
         """
         self.gbm = gbm
         self.block_manager = block_manager
+        self.model_runner = model_runner
 
     # ------------------------------------------------------------------
     # 请求路由
@@ -282,42 +284,50 @@ class GlobalScheduler:
 
         return True
 
-    def _execute_swap_out(
-        self,
-        blocks: List[int],
-        local_gpu: int,
-        target_gpu: int,
-    ):
-        """
-        在源 GPU 上执行 swap_out
-        直接调用 kv_transfer 的 send 逻辑
-        """
-        from myvllm.engine.kv_transfer import _send_block_list, _compute_tag
-        import time
+    # def _execute_swap_out(
+    #     self,
+    #     blocks: List[int],
+    #     local_gpu: int,
+    #     target_gpu: int,
+    # ):
+    #     """
+    #     在源 GPU 上执行 swap_out
+    #     直接调用 kv_transfer 的 send 逻辑
+    #     """
+    #     from myvllm.engine.kv_transfer import _send_block_list, _compute_tag
+    #     import time
 
-        device = f"cuda:{local_gpu}"
-        # 这里需要 kv_cache 的引用，由外部 ModelRunner 提供
-        # 暂时留空，由实际调用方注入
-        raise NotImplementedError(
-            "swap_out 需要 kv_cache 张量引用，请在 ModelRunner 中调用 "
-            "kv_transfer.swap_out() 完成实际数据传输"
-        )
+    #     device = f"cuda:{local_gpu}"
+    #     # 这里需要 kv_cache 的引用，由外部 ModelRunner 提供
+    #     # 暂时留空，由实际调用方注入
+    #     raise NotImplementedError(
+    #         "swap_out 需要 kv_cache 张量引用，请在 ModelRunner 中调用 "
+    #         "kv_transfer.swap_out() 完成实际数据传输"
+    #     )
 
-    def _execute_swap_in_accept(
-        self,
-        blocks: List[int],
-        source_gpu: int,
-        local_gpu: int,
-    ):
-        """
-        在目标 GPU 上接收 swap_out 的数据。
-        """
-        from myvllm.engine.kv_transfer import _recv_block_list
-        raise NotImplementedError(
-            "swap_in_accept 需要 kv_cache 张量引用，请在 ModelRunner 中调用 "
-            "kv_transfer 完成实际数据传输"
-        )
+    # def _execute_swap_in_accept(
+    #     self,
+    #     blocks: List[int],
+    #     source_gpu: int,
+    #     local_gpu: int,
+    # ):
+    #     """
+    #     在目标 GPU 上接收 swap_out 的数据
+    #     """
+    #     from myvllm.engine.kv_transfer import _recv_block_list
+    #     raise NotImplementedError(
+    #         "swap_in_accept 需要 kv_cache 张量引用，请在 ModelRunner 中调用 "
+    #         "kv_transfer 完成实际数据传输"
+    #     )
 
+    def _execute_swap_out(self, blocks, local_gpu, target_gpu):
+        if self.model_runner is not None:
+            self.model_runner.execute_swap_out(blocks, target_gpu)
+
+    def _execute_swap_in_accept(self, blocks, source_gpu, local_gpu):
+        if self.model_runner is not None:
+            self.model_runner.execute_swap_in(source_gpu, blocks)
+    
     # ------------------------------------------------------------------
     # 抢占回退
     # ------------------------------------------------------------------

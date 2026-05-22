@@ -116,6 +116,11 @@ class BlockManager:
                     self.hash_to_block_id[h] = block.block_id
             seq.block_table.append(block.block_id)
 
+        # 注册到全局页表
+        if self.gbm is not None and h != -1:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            self.gbm._commit_alloc(rank, [block.block_id], [h])
+
     def deallocate(self, seq: Sequence) -> None:
         # update block information
         for block_id in seq.block_table:
@@ -155,6 +160,12 @@ class BlockManager:
             block = self.blocks[last_block_for_seq_id]
             block.update(h=h, token_ids=seq.block(seq.num_blocks - 1))
             self.hash_to_block_id[h] = block.block_id
+
+            # 注册到全局页表
+            if self.gbm is not None and h != -1:
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                self.gbm._commit_alloc(rank, [block.block_id], [h])
+
         # if one new block is needed
         elif seq.num_tokens % self.block_size == 1:
             # Previous block should be finalized

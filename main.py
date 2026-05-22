@@ -42,8 +42,9 @@ config = {
     'ffn_bias': False,  # Fixed: HF Qwen3 doesn't use MLP bias
     'max_num_batch_tokens': 4096,
     # 'max_model_length': 128,
-    'max_model_length': 4096,
-    'gpu_memory_utilization': 0.9,
+    'max_model_length': 2048,
+    # 'gpu_memory_utilization': 0.9,
+    'gpu_memory_utilization': 0.05,
     'eos': 151645,  # Fixed: should match tokenizer.eos_token_id
     'log_level': 'INFO',
     'log_timing': True,
@@ -90,12 +91,64 @@ def main():
     # max_model_length is the max total length including prompt
     # both should be set in SamplingParams and help to determine when to stop generation
     # sampling_params = SamplingParams(temperature=0.6, max_tokens=256, max_model_length=128)
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=2048, max_model_length=4096)
+    sampling_params = SamplingParams(temperature=0.6, max_tokens=4096, max_model_length=2048)
+    # prompts = [
+    #     "introduce yourself",# * 15,
+    #     "list all prime numbers within 100",# * 15,
+    #     "give me your opinion on the impact of artificial intelligence on society",# * 15,
+    # ] #* 30
+
+    
+    # ========================================================================
+    # Swap 压力测试：构造长前缀 + 高并发，耗尽空闲块
+    # ========================================================================
+    
+    # 构造一个长共享前缀
+    shared_prefix = (
+        "Artificial intelligence is a field of computer science that aims to create "
+        "systems capable of performing tasks that normally require human intelligence. "
+        "These tasks include learning, reasoning, problem-solving, perception, and language "
+        "understanding. Machine learning is a subset of AI that focuses on building systems "
+        "that can learn from data. Deep learning is a further subset that uses neural networks "
+        "with many layers. The history of AI dates back to the 1950s, but the field has seen "
+        "several booms and busts. The current AI boom is driven by advances in deep learning, "
+        "the availability of large datasets, and powerful GPU hardware. Key applications include "
+        "natural language processing, computer vision, speech recognition, and autonomous vehicles. "
+        "AI systems can be categorized into narrow AI, which is designed for specific tasks, and "
+        "general AI, which would possess human-like cognitive abilities. Currently, all deployed "
+        "AI systems are narrow AI. The development of general AI remains a long-term research goal. "
+        "Ethical considerations around AI include bias in training data, privacy concerns, job "
+        "displacement, and the potential for misuse. Researchers and policymakers are actively "
+        "working on frameworks for responsible AI development. The transformer architecture, "
+        "introduced in 2017, has become the foundation for most modern language models including "
+        "GPT, BERT, and their derivatives. These models use self-attention mechanisms to process "
+        "sequential data. Scaling laws suggest that larger models trained on more data continue "
+        "to improve predictably. However, the computational cost of training and deploying these "
+        "models is substantial. Efficient inference techniques like quantization, pruning, and "
+        "knowledge distillation are active research areas. Now, please answer the following question: "
+    )
+    
+    # 用同一个长前缀 + 不同后缀，让前缀被共享
     prompts = [
-        "introduce yourself",# * 15,
-        "list all prime numbers within 100",# * 15,
-        "give me your opinion on the impact of artificial intelligence on society",# * 15,
-    ] #* 30
+        shared_prefix + "introduce yourself",
+        shared_prefix + "list all prime numbers within 100",
+        shared_prefix + "give me your opinion on the impact of artificial intelligence on society",
+        shared_prefix + "what is the capital of France?",
+        shared_prefix + "explain quantum computing in simple terms",
+        shared_prefix + "write a haiku about programming",
+        shared_prefix + "what is the difference between DNA and RNA?",
+        shared_prefix + "how does a blockchain work?",
+        shared_prefix + "explain the theory of relativity briefly",
+        shared_prefix + "what are the benefits of renewable energy?",
+        shared_prefix + "describe the water cycle",
+        shared_prefix + "what is machine learning?",
+        shared_prefix + "how do airplanes fly?",
+        shared_prefix + "explain the Pythagorean theorem",
+        shared_prefix + "what is the speed of light?",
+        shared_prefix + "write a short poem about the ocean",
+    ] # * 30
+
+
     prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],

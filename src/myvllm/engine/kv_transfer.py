@@ -10,11 +10,12 @@ KV cache 数据的直接搬运
 3. 支持全局内存池枯竭时的覆盖写入（overwrite）
 4. 目标 GPU 空闲块分配由 GlobalBlockManager 协调
 """
-
+import logging
 import torch
 import torch.distributed as dist
 from typing import List, Tuple, Optional
 
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # 工具函数
@@ -109,6 +110,8 @@ def swap_out(
     返回:
         target_gpu 上新分配的块索引列表
     """
+    logger.info(f"swap_out: GPU{local_gpu} -> GPU{target_gpu} | blocks={blocks_to_evict}")
+
     rank = dist.get_rank()
     num_blocks = len(blocks_to_evict)
     device = f"cuda:{rank}"
@@ -191,6 +194,8 @@ def swap_in(
     返回:
         本地新分配的块索引列表
     """
+    logger.info(f"swap_in: GPU{remote_gpu} -> GPU{local_gpu} | blocks={remote_blocks}")
+
     rank = dist.get_rank()
     device = f"cuda:{rank}"
 
