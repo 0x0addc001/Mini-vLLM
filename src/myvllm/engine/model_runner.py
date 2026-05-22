@@ -1,4 +1,6 @@
 import math
+import logging
+import time
 import torch
 import pickle
 import torch.distributed as dist
@@ -13,6 +15,8 @@ from myvllm.layers.sampler import SamplerLayer
 from myvllm.engine.sequence import Sequence
 from myvllm.engine.global_block_manager import GlobalBlockManager
 from myvllm.utils import *
+
+logger = logging.getLogger(__name__)
 
 
 class ModelRunner:
@@ -36,6 +40,11 @@ class ModelRunner:
         self.world_size = config['world_size']
         self.enforce_eager = config.get('enforce_eager', False)
         self.enable_global_pool = config.get('enable_global_pool', False)
+        self.log_timing = config.get('log_timing', True)
+        self.log_decode_every_n = max(1, config.get('log_decode_every_n', 16))
+        self._decode_log_counter = 0
+        self._decode_log_tokens = 0
+        self._decode_log_seconds = 0.0
 
         self.rank = rank
         dist.init_process_group('nccl', "tcp://localhost:12347", world_size=config['world_size'], rank=rank)
@@ -114,18 +123,18 @@ class ModelRunner:
             if self.rank == 0:
                 # 只有 rank 0 从磁盘加载权重
                 load_weights_from_checkpoint(self.model, config['model_name_or_path'])
-                print(f"[Rank 0] Weight loading completed")
+                logger.info("rank 0 weight loading completed")
             
             if self.world_size > 1:
                 # 确保 rank 0 加载完成后，其他 rank 才能开始广播
                 dist.barrier()
-                print(f"[Rank {self.rank}] Passed barrier after weight loading") 
+                logger.debug("rank %s passed barrier after weight loading", self.rank)
                 # 广播所有权重给其他 rank
                 for param in self.model.parameters():
                     dist.broadcast(param.data, src=0)
                 dist.barrier()
                 if self.rank == 0:
-                    print(f"[Rank 0] Weight broadcast completed")
+                    logger.info("rank 0 weight broadcast completed")
 
         # Load weights in CPU (move the model to GPU after loading weights)
         # self.model = self.model.cuda(rank)
@@ -265,7 +274,7 @@ class ModelRunner:
         assert num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
 
         if self.world_size > 1:
-            print(f"[Rank {self.rank}] Local max_cached_blocks: {num_available_kv_blocks}")
+            logger.info("rank %s local max_cached_blocks=%s", self.rank, num_available_kv_blocks)
             per_rank_max_blocks_tensor = torch.tensor(
                 num_available_kv_blocks,
                 dtype=torch.long,
@@ -282,7 +291,7 @@ class ModelRunner:
             # Single GPU: no cross-rank sync needed; use the local value directly.
             self.config['max_cached_blocks'] = num_available_kv_blocks
         if self.rank == 0:
-            print(f"[Rank 0] Global max_cached_blocks (min): {self.config['max_cached_blocks']}")
+            logger.info("rank 0 global max_cached_blocks=%s", self.config['max_cached_blocks'])
 
         allocated_kv_cache = torch.zeros(
             2, self.config['num_layers'], self.config['max_cached_blocks'],
@@ -341,13 +350,6 @@ class ModelRunner:
             for i, seq in enumerate(seqs):
                 block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
                 block_tables.append(block_table)
-
-        # ==========
-        # print(f"[Rank {dist.get_rank()}] slot_mappings len={len(slot_mappings)}, block_table={[s.block_table for s in seqs]}")
-        print(f"[Rank {dist.get_rank()}] slot_mappings len={len(slot_mappings)}, "
-                f"seq[0].num_cached_tokens={seqs[0].num_cached_tokens}, "
-                f"block_table={[s.block_table for s in seqs]}")
-        # ==========
 
         input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
         slot_mapping_tensor = torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
@@ -444,7 +446,11 @@ class ModelRunner:
         - 拉取完成后更新 seq.block_table，后续 attention 全部走本地
         """
         phase = "PREFILL" if is_prefill else "DECODE"
-        print(f"[Rank {self.rank}] {phase} | num_seqs={len(seqs)} | tokens={sum(len(s) for s in seqs) if is_prefill else len(seqs)}")
+        num_tokens = sum(len(s) for s in seqs) if is_prefill else len(seqs)
+        seq_ids = [seq.seq_id for seq in seqs]
+        if self.log_timing:
+            torch.cuda.synchronize(self.rank)
+        start_t = time.time()
         # ------------------------------------------------ #
         # 执行前：拉取所有标记的远程块到本地
         # ------------------------------------------------ #
@@ -471,8 +477,38 @@ class ModelRunner:
         # 所有 rank 都采样
         token_ids = self.sampler(logits, self.prepare_sample(seqs))
         reset_context()
-        print(f"[Rank {self.rank}] run() finished, token_ids={token_ids[:5] if token_ids is not None else None}...")
+        if self.log_timing:
+            torch.cuda.synchronize(self.rank)
+        elapsed = time.time() - start_t
+        self._log_run_timing(phase, seq_ids, num_tokens, elapsed)
         return token_ids
+
+    def _log_run_timing(self, phase: str, seq_ids: list[int], num_tokens: int, elapsed: float):
+        tokens_per_sec = num_tokens / max(elapsed, 1e-10)
+        if phase == "PREFILL":
+            logger.info(
+                "rank %s PREFILL done: seqs=%s tokens=%s elapsed=%.4fs throughput=%.2f tok/s",
+                self.rank,
+                seq_ids,
+                num_tokens,
+                elapsed,
+                tokens_per_sec,
+            )
+            return
+
+        self._decode_log_counter += 1
+        self._decode_log_tokens += num_tokens
+        self._decode_log_seconds += elapsed
+        if self._decode_log_counter == 1 or self._decode_log_counter % self.log_decode_every_n == 0:
+            logger.info(
+                "rank %s DECODE progress: steps=%s tokens=%s elapsed=%.4fs throughput=%.2f tok/s active_seqs=%s",
+                self.rank,
+                self._decode_log_counter,
+                self._decode_log_tokens,
+                self._decode_log_seconds,
+                self._decode_log_tokens / max(self._decode_log_seconds, 1e-10),
+                seq_ids,
+            )
 
     # ------------------------------------------------------------------
     # CUDA graph 捕获

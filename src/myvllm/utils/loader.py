@@ -1,9 +1,12 @@
+import logging
 import torch
 from torch import nn
 import os
 from safetensors import safe_open
 from transformers import AutoConfig
 import re
+
+logger = logging.getLogger(__name__)
 
 
 def default_weight_loader(param, weight):
@@ -176,46 +179,44 @@ def load_weights_from_checkpoint(model: nn.Module, model_name_or_path: str):
         if name not in loaded_params:
             unloaded_params.append(name)
 
-    print(f"\n{'='*80}")
-    print(f"Weight Loading Summary:")
-    print(f"{'='*80}")
-    print(f"Successfully loaded: {len([p for p in loaded_params if not any(x in p for x in ['.k_proj.', '.v_proj.', '.up_proj.'])])} parameter groups")
+    loaded_count = len([p for p in loaded_params if not any(x in p for x in ['.k_proj.', '.v_proj.', '.up_proj.'])])
+    merged_skips = [s for s in skipped_params if "Merged" in s[1]]
+    not_found_skips = [s for s in skipped_params if "not found" in s[1]]
+    no_mapping_skips = [s for s in skipped_params if "No mapping" in s[1]]
+    error_skips = [s for s in skipped_params if "Error" in s[1]]
+
+    logger.info(
+        "loader loaded=%s, merged_skips=%s, unloaded=%s, errors=%s",
+        loaded_count,
+        len(merged_skips),
+        len(unloaded_params),
+        len(error_skips),
+    )
 
     if unloaded_params:
-        print(f"\n⚠️  WARNING: {len(unloaded_params)} model parameters NOT loaded from checkpoint:")
+        logger.warning("loader: %s model parameters not loaded", len(unloaded_params))
         for name in unloaded_params[:15]:
             param = dict(model.named_parameters())[name]
-            print(f"  - {name} (shape: {param.shape}, mean: {param.data.mean():.6f})")
+            logger.warning("  - %s (shape: %s, mean: %.6f)", name, param.shape, param.data.mean())
         if len(unloaded_params) > 15:
-            print(f"  ... and {len(unloaded_params) - 15} more")
+            logger.warning("  ... and %s more", len(unloaded_params) - 15)
 
     if skipped_params:
-        # Group skipped by reason
-        merged_skips = [s for s in skipped_params if "Merged" in s[1]]
-        not_found_skips = [s for s in skipped_params if "not found" in s[1]]
-        no_mapping_skips = [s for s in skipped_params if "No mapping" in s[1]]
-
-        if merged_skips:
-            print(f"Skipped (merged into other weights): {len(merged_skips)}")
         if not_found_skips:
-            print(f"Skipped (not found in model): {len(not_found_skips)}")
+            logger.warning("loader skipped not found: %s", len(not_found_skips))
             for name, reason in not_found_skips[:5]:
-                print(f"  - {name}")
+                logger.warning("  - %s", name)
             if len(not_found_skips) > 5:
-                print(f"  ... and {len(not_found_skips) - 5} more")
+                logger.warning("  ... and %s more", len(not_found_skips) - 5)
         if no_mapping_skips:
-            print(f"Skipped (no mapping rule): {len(no_mapping_skips)}")
+            logger.warning("loader skipped no mapping: %s", len(no_mapping_skips))
             for name, reason in no_mapping_skips[:5]:
-                print(f"  - {name}")
+                logger.warning("  - %s", name)
             if len(no_mapping_skips) > 5:
-                print(f"  ... and {len(no_mapping_skips) - 5} more")
+                logger.warning("  ... and %s more", len(no_mapping_skips) - 5)
 
-    print(f"{'-'*80}")
-    print("[DEBUG] Detailed skipped parameters (first 15):")
-    error_skips = [s for s in skipped_params if "Error" in s[1]]
     if error_skips:
-        print(f"⚠️ FAILED due to errors: {len(error_skips)}")
+        logger.error("loader failed due to errors: %s", len(error_skips))
         for name, reason in error_skips[:15]:
-            print(f"  - {name}: {reason}")
-    print(f"{'='*80}")
+            logger.error("  - %s: %s", name, reason)
     return loaded_params

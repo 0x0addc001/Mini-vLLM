@@ -44,6 +44,9 @@ config = {
     'max_model_length': 128,
     'gpu_memory_utilization': 0.9,
     'eos': 151645,  # Fixed: should match tokenizer.eos_token_id
+    'log_level': 'INFO',
+    'log_timing': True,
+    'log_decode_every_n': 16,  # set to 1 to log every decode step per rank
     # -------------------------------------------------------------------- #
     # 以下是全局 KV cache 池相关配置，启用后可在多 GPU 之间共享 KV cache，支持更大模型和更长上下文，但需要更多通信开销
     # -------------------------------------------------------------------- #

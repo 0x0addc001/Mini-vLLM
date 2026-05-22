@@ -24,8 +24,9 @@ class Scheduler:
         eos: int,
         global_scheduler: GlobalScheduler = None,
     ):
+        gbm = global_scheduler.gbm if global_scheduler is not None else None
         # block manager
-        self.block_manager = BlockManager(max_cached_blocks, block_size)
+        self.block_manager = BlockManager(max_cached_blocks, block_size, gbm=gbm)
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_num_sequences = max_num_sequences
         # sequence queue
@@ -37,6 +38,8 @@ class Scheduler:
         # 全局调度器接口
         # --------------------------------------------- #
         self.global_scheduler = global_scheduler
+        if self.global_scheduler is not None:
+            self.global_scheduler.block_manager = self.block_manager
         
         # 当前 rank（用于路由判断）
         self.rank = dist.get_rank() if dist.is_initialized() else 0
@@ -46,6 +49,18 @@ class Scheduler:
 
     def add_sequence(self, sequence: Sequence):
         self.waiting.append(sequence)
+
+    def _sync_local_state_to_global(self):
+        if self.global_scheduler is None:
+            return
+        gbm = self.global_scheduler.gbm
+        if gbm is None or not gbm.is_master:
+            return
+        gbm.update_gpu_state(
+            self.rank,
+            len(self.block_manager.free_block_ids),
+            self.block_manager.get_local_block_hashes(),
+        )
 
 
     def schedule(self) -> tuple[list[Sequence], bool]:
@@ -57,8 +72,6 @@ class Scheduler:
             - scheduled_sequences: 本轮需要执行的序列列表
             - is_prefill: True 表示 prefill 阶段，False 表示 decode 阶段
         """
-        print(f"[Rank {dist.get_rank()}] schedule() entered, waiting={len(self.waiting)}, running={len(self.running)}")
-
         scheduled_sequences = []
         current_scheduled_tokens = 0
 
@@ -72,7 +85,12 @@ class Scheduler:
             # 全局路由决策
             # -------------------------------------------------------- #
             if self.global_scheduler is not None:
-                target_gpu = self.global_scheduler.route_sequence(seq)
+                if seq.remote_gpu_id == self.rank:
+                    target_gpu = self.rank
+                elif seq.remote_gpu_id != -1:
+                    target_gpu = seq.remote_gpu_id
+                else:
+                    target_gpu = self.global_scheduler.route_sequence(seq)
                 seq.remote_gpu_id = target_gpu if target_gpu != self.rank else -1
 
                 # 如果序列路由到其他 GPU，从本地 waiting 移除并发送过去
@@ -88,6 +106,8 @@ class Scheduler:
                     seq.status = SequenceStatus.RUNNING
                     scheduled_sequences.append(seq)       # 保留在调度列表里
                     current_scheduled_tokens += len(seq)
+                    if self.global_scheduler.gbm is not None:
+                        self.global_scheduler.gbm.reserve_blocks(target_gpu, seq.num_blocks)
                     # 不在这里分配 block，由目标 rank 自己分配
                     continue
             # -------------------------------------------------------- #
@@ -105,6 +125,7 @@ class Scheduler:
                         self.running.append(seq)
                         current_scheduled_tokens += len(seq)
                         scheduled_sequences.append(seq)
+                        self._sync_local_state_to_global()
                         continue
                 # swap 失败或未启用全局池化：停止 prefill
                 break
@@ -120,6 +141,7 @@ class Scheduler:
             self.running.append(seq)
             current_scheduled_tokens += len(seq)
             scheduled_sequences.append(seq)
+            self._sync_local_state_to_global()
 
         if scheduled_sequences:
             # # 周期性同步全局页表
@@ -132,11 +154,9 @@ class Scheduler:
         # ================================================================
         while self.running:
             seq = self.running.popleft()
-            print(f"[Rank {dist.get_rank()}] decode: seq {seq.seq_id}, num_tokens={seq.num_tokens}")
 
             # 检查是否可以追加一个 token
             if not self.block_manager.can_append(seq):
-                print(f"[Rank {dist.get_rank()}] decode: can_append=False for seq {seq.seq_id}")
                 # ---------------------------------------------------- #
                 # 全局 rebalance：尝试腾出 1 个块
                 # ---------------------------------------------------- #
@@ -167,12 +187,11 @@ class Scheduler:
                 self.running.appendleft(seq)
                 break
 
-            print(f"[Rank {dist.get_rank()}] decode: appending seq {seq.seq_id}")
             # 追加一个 token
             self.block_manager.append(seq)
             scheduled_sequences.append(seq)
             current_scheduled_tokens += 1
-            print(f"[Rank {dist.get_rank()}] decode: appended seq {seq.seq_id}")
+            self._sync_local_state_to_global()
 
         # 把已调度的序列重新放回 running 队列末尾（保持轮转顺序）
         if scheduled_sequences:
@@ -182,7 +201,6 @@ class Scheduler:
         # if self.global_scheduler is not None:
         #     self.global_scheduler.gbm.maybe_sync()
 
-        print(f"[Rank {dist.get_rank()}] schedule() returning, scheduled={len(scheduled_sequences)}")
         return scheduled_sequences, False
 
 
@@ -197,6 +215,7 @@ class Scheduler:
         seq.remote_gpu_id = -1
         seq.pending_swap_in = []
         self.waiting.appendleft(seq)
+        self._sync_local_state_to_global()
 
 
     # postprocess after generation to check whether sequences are finished
@@ -220,10 +239,9 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+                self._sync_local_state_to_global()
 
-            if seq.status == SequenceStatus.FINISHED:
-                self.block_manager.deallocate(seq)
-            elif seq.status == SequenceStatus.WAITING:
+            if seq.status == SequenceStatus.WAITING:
                 # 进到这里说明该序列顺利完成了推理，且没有触发 FINISHED 结束条件
                 # 意味着它刚刚完成了 Prefill 阶段，现在需要强制进入 Decode 状态
                 seq.status = SequenceStatus.RUNNING

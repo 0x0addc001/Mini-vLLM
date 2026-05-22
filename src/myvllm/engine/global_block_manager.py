@@ -9,11 +9,14 @@
 4. 三级内存池枯竭应对：递归 swap -> 远端 LRU 覆盖 -> CPU fallback signal
 """
 
+import logging
 import time
 import torch
 import torch.distributed as dist
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Set
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -133,10 +136,10 @@ class GlobalBlockManager:
                 old_master = self.master_rank
                 self.master_rank = new_master
                 if self.rank == new_master:
-                    print(f"[GlobalBlockManager] Master failover: rank {old_master} -> rank {new_master} (me)")
+                    logger.warning("master failover: rank %s -> rank %s (me)", old_master, new_master)
                     return True
                 else:
-                    print(f"[GlobalBlockManager] Master failover: rank {old_master} -> rank {new_master}")
+                    logger.warning("master failover: rank %s -> rank %s", old_master, new_master)
                     return False
         except Exception:
             pass
@@ -224,6 +227,61 @@ class GlobalBlockManager:
             # self.check_master_health() # 暂时禁用故障检测，只做页表广播
             if self.is_master:
                 self.broadcast_page_table()
+
+    def update_gpu_state(
+        self,
+        gpu_id: int,
+        free_blocks: int,
+        block_hashes: Dict[int, int],
+    ):
+        """
+        Master-only state ingestion boundary.
+
+        Each worker owns the real local BlockManager/KV cache for its GPU and
+        reports a compact snapshot through the engine message queue. Rank 0 is
+        the authoritative GlobalBlockManager master for routing decisions.
+        """
+        if not self.is_master:
+            return
+
+        now = time.time()
+        self.free_blocks_per_gpu[gpu_id] = free_blocks
+
+        old_hashes = self.block_hash[gpu_id]
+        for block_id, old_hash in list(old_hashes.items()):
+            if old_hash in self.global_page_table:
+                self.global_page_table[old_hash] = [
+                    loc for loc in self.global_page_table[old_hash]
+                    if not (loc.gpu_id == gpu_id and loc.block_id == block_id)
+                ]
+                if not self.global_page_table[old_hash]:
+                    del self.global_page_table[old_hash]
+
+        self.block_hash[gpu_id] = dict(block_hashes)
+        self.block_access_time[gpu_id] = {
+            block_id: now for block_id in block_hashes
+        }
+
+        for block_id, block_hash in block_hashes.items():
+            if block_hash == -1:
+                continue
+            self.global_page_table.setdefault(block_hash, []).append(
+                BlockLocation(gpu_id, block_id, block_hash, now)
+            )
+
+    def reserve_blocks(self, gpu_id: int, num_blocks: int):
+        """
+        Master-only optimistic reservation for requests routed to a worker.
+
+        The worker later reports the exact local BlockManager state through
+        update_gpu_state(), which overwrites this estimate.
+        """
+        if not self.is_master:
+            return
+        self.free_blocks_per_gpu[gpu_id] = max(
+            0,
+            self.free_blocks_per_gpu[gpu_id] - num_blocks,
+        )
 
     # ------------------------------------------------------------------
     # 拓扑辅助函数

@@ -1,10 +1,12 @@
 import atexit
+import logging
 import torch
 import torch
 import torch.distributed as dist
 import time
 import torch.multiprocessing as mp
 from multiprocessing import Queue
+from queue import Empty
 
 from myvllm.engine.sequence import Sequence
 from myvllm.engine.scheduler import Scheduler
@@ -14,14 +16,36 @@ from myvllm.engine.global_scheduler import GlobalScheduler
 from myvllm.sampling_parameters import SamplingParams
 from transformers import AutoTokenizer
 
+logger = logging.getLogger(__name__)
+
 
 def _as_token_list(tokens):
     return [t.item() if isinstance(t, torch.Tensor) else t for t in tokens]
 
 
+def _configure_logging(config: dict):
+    level_name = str(config.get("log_level", "INFO")).upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="[%(levelname)s] %(message)s",
+    )
+
+
+def _block_state_message(rank: int, scheduler: Scheduler) -> dict:
+    block_manager = scheduler.block_manager
+    return {
+        "type": "block_state",
+        "rank": rank,
+        "free_blocks": len(block_manager.free_block_ids),
+        "block_hashes": block_manager.get_local_block_hashes(),
+    }
+
+
 # def worker_process(config, rank, event):
 def worker_process(config, rank, recv_queue: Queue, send_queue: Queue):
     """Worker process function that initializes ModelRunner and enters loop."""
+    _configure_logging(config)
     # FIRST print before any other code
     import sys
     import os
@@ -49,65 +73,62 @@ def worker_process(config, rank, recv_queue: Queue, send_queue: Queue):
         eos=config.get("eos", 50256),
         global_scheduler=GlobalScheduler(gbm=gbm, block_manager=None),
     )
-    # scheduler.global_scheduler.block_manager = scheduler.block_manager
-    # # 进入独立推理循环
-    # while True:
-    #     # 从某个队列接收序列，或者由外部推送
-    #     seqs = receive_sequences()  # 需要实现
-    #     if seqs:
-    #         for seq in seqs:
-    #             scheduler.add_sequence(seq)
-    #     scheduled, is_prefill = scheduler.schedule()
-    #     if scheduled:
-    #         outputs = model_runner.run(scheduled, is_prefill)
-    #         scheduler.postprocess(scheduled, outputs)
 
-    # 独立推理循环
-    was_idle = False
-    while True:
-        # 1. 接收 Rank 0 发来的序列
-        received_any = False
+    def handle_message(msg) -> bool:
+        if msg.get("type") == "exit":
+            model_runner.exit()
+            return False
+        if msg.get("type") == "sequence":
+            seq = msg["seq"]
+            scheduler.add_sequence(seq)
+            return True
+        return True
+
+    def send_block_state():
         try:
+            send_queue.put_nowait(_block_state_message(rank, scheduler))
+        except Exception as e:
+            logger.debug("rank %s failed to send block state: %s", rank, e)
+
+    send_block_state()
+    idle_sent = False
+
+    while True:
+        received_seq_ids = []
+        try:
+            timeout = 0.05 if scheduler.is_finished() else 0.0
+            msg = recv_queue.get(timeout=timeout)
+            if not handle_message(msg):
+                return
+            if msg.get("type") == "sequence":
+                received_seq_ids.append(msg["seq"].seq_id)
+
             while True:
                 msg = recv_queue.get_nowait()
-                received_any = True
-                if msg.get("type") == "exit":
-                    model_runner.exit()
+                if not handle_message(msg):
                     return
                 if msg.get("type") == "sequence":
-                    seq = msg["seq"]
-                    print(f"[Rank {rank}] Received seq: type={type(seq)}, seq_id={getattr(seq, 'seq_id', 'MISSING')}, tokens={seq.token_ids[:10]}...")
-                    scheduler.add_sequence(seq)
-                    # scheduler.add_sequence(msg["seq"])
-                    was_idle = False
-        except Exception as e:
-            if received_any:
-                print(f"[Rank {rank}] recv drained: {e}")
+                    received_seq_ids.append(msg["seq"].seq_id)
+        except Empty:
             pass
+        except Exception as e:
+            logger.warning("rank %s recv error: %s", rank, e)
 
-        # 2. 调度
-        print(f"[Rank {rank}] Before schedule: waiting={len(scheduler.waiting)}, running={len(scheduler.running)}")
+        if received_seq_ids:
+            logger.info("rank %s received %s seqs: %s", rank, len(received_seq_ids), received_seq_ids)
+            idle_sent = False
+
         scheduled, is_prefill = scheduler.schedule()
-        print(f"[Rank {rank}] After schedule: scheduled={len(scheduled)}, is_prefill={is_prefill}")
-        # scheduled, is_prefill = scheduler.schedule()
         if not scheduled:
-            # 如果本地没有序列且没有外部输入，短暂空转
-            if scheduler.is_finished() and recv_queue.empty():
-                if not was_idle: # 只在首次空闲时发
-                    print(f"[Rank {rank}] Sending idle, queue size={send_queue.qsize()}")
-                    # 通知 Rank 0 当前空闲
-                    # send_queue.put({"type": "idle", "rank": rank})
-                    try:
-                        send_queue.put_nowait({"type": "idle", "rank": rank})
-                    except:
-                        pass
-                    was_idle = True
-                    print(f"[Rank {rank}] Idle sent")
-                time.sleep(0.01)
+            if scheduler.is_finished() and recv_queue.empty() and not idle_sent:
+                try:
+                    send_queue.put_nowait({"type": "idle", "rank": rank})
+                    idle_sent = True
+                except Exception as e:
+                    logger.debug("rank %s failed to send idle: %s", rank, e)
             continue
-        
-        was_idle = False  # 有活干了，重置
-        
+        idle_sent = False
+
         # 3. 分离本地和远程序列
         local_seqs = [s for s in scheduled if s.remote_gpu_id in (-1, rank)]
         remote_seqs = [s for s in scheduled if s.remote_gpu_id not in (-1, rank)]
@@ -119,17 +140,15 @@ def worker_process(config, rank, recv_queue: Queue, send_queue: Queue):
         # 5. 本地执行
         if local_seqs:
             outputs = model_runner.run(local_seqs, is_prefill)
-            # scheduler.postprocess(local_seqs, outputs)
-            print(f"[Rank {rank}] Before postprocess")
             scheduler.postprocess(local_seqs, outputs)
-            print(f"[Rank {rank}] After postprocess")
+            send_block_state()
 
         # 6. 收集完成的序列，回传 Rank 0
         # finished = [(s.seq_id, s.completion_token_ids) for s in scheduled if s.is_finished]
         finished = [(s.seq_id, _as_token_list(s.completion_token_ids))
             for s in scheduled if s.is_finished]
         if finished:
-            print(f"[Rank {rank}] Sending finished: {finished}")
+            logger.info("rank %s finished seqs: %s", rank, [seq_id for seq_id, _ in finished])
             send_queue.put({"type": "finished", "data": finished})
 
 
@@ -144,6 +163,7 @@ class LLMEngine:
     """
 
     def __init__(self, config: dict):
+        _configure_logging(config)
         self.config = config
         self.world_size = config.get("world_size", 1)
         ctx = mp.get_context("spawn")
@@ -208,6 +228,11 @@ class LLMEngine:
         )
         if gbm:
             self.scheduler.global_scheduler.block_manager = self.scheduler.block_manager
+            gbm.update_gpu_state(
+                0,
+                len(self.scheduler.block_manager.free_block_ids),
+                self.scheduler.block_manager.get_local_block_hashes(),
+            )
         atexit.register(self.exit)
 
         # self.events = []
@@ -284,7 +309,16 @@ class LLMEngine:
                             self.remote_inflight_seq_ids.discard(seq_id)
                     elif msg_type == "idle":
                         self.remote_finished.add(rank)
-            except:
+                    elif msg_type == "block_state" and self.scheduler.global_scheduler is not None:
+                        self.scheduler.global_scheduler.gbm.update_gpu_state(
+                            msg["rank"],
+                            msg["free_blocks"],
+                            msg["block_hashes"],
+                        )
+            except Empty:
+                pass
+            except Exception as e:
+                logger.warning("worker message error from rank %s: %s", rank, e)
                 pass
         return finished
 
@@ -344,15 +378,20 @@ class LLMEngine:
 
         # 本地执行
         if local_seqs:
-            print(f"[Rank 0] Running local prefill...")
             outputs = self.model_runner.run(local_seqs, is_prefill)
-            print(f"[Rank 0] Local prefill done, outputs={outputs}")
             self.scheduler.postprocess(local_seqs, outputs)
+            if self.scheduler.global_scheduler is not None:
+                self.scheduler.global_scheduler.gbm.update_gpu_state(
+                    0,
+                    len(self.scheduler.block_manager.free_block_ids),
+                    self.scheduler.block_manager.get_local_block_hashes(),
+                )
             # 本地完成的序列
             finished.extend([(s.seq_id, _as_token_list(s.completion_token_ids)) for s in local_seqs if s.is_finished])
         # 收集其他 rank 完成的序列
-        print(f"[Rank 0] Collecting finished from ranks {list(self.recv_queues.keys())}")
         finished.extend(self._drain_worker_messages())
+        if finished:
+            logger.info("rank 0 collected finished seqs: %s", [seq_id for seq_id, _ in finished])
 
         num_tokens = sum(len(s) for s in scheduled_sequences) if is_prefill else len(scheduled_sequences)
         return finished, num_tokens, is_prefill
@@ -406,6 +445,8 @@ class LLMEngine:
         for prompt in prompts:
             self.add_prompt(prompt, sampling_params)
         generated_tokens = {}
+        total_processed_tokens = 0
+        total_runtime = 0.0
         # while not self.scheduler.is_finished():
         # 退出条件：本地空闲 + 所有远程 rank 都发回了 finished
         expected_num_outputs = len(prompts)
@@ -416,16 +457,30 @@ class LLMEngine:
                 outputs, num_processed_tokens, is_prefill = self.step()
             except Exception as e:
                 import traceback
-                print(f"\n[Rank {self.rank}] ====== Engine step error ======")
+                logger.error("rank %s engine step error", self.rank)
                 traceback.print_exc()
-                print(f"[Rank {self.rank}] ===============================\n")
                 # 发生异常时，由于无法获取本轮数据，为了防止后续代码因变量未定义报错，这里直接中断或跳过
                 break
             end_t = time.time()
             running_time = end_t - start_t + 1e-10
             phase = "prefilling" if is_prefill else "decoding"
-            print(num_processed_tokens, 'number of processed tokens', num_processed_tokens/running_time, "tokens/sec during", phase)
+            if num_processed_tokens:
+                total_processed_tokens += num_processed_tokens
+                total_runtime += running_time
+                log_fn = logger.info if is_prefill else logger.debug
+                log_fn(
+                    "rank 0 %s: %s tokens, %.2f tokens/sec",
+                    phase,
+                    num_processed_tokens,
+                    num_processed_tokens / running_time,
+                )
             generated_tokens.update({seq_id: tokens for seq_id, tokens in outputs})
+        if total_processed_tokens:
+            logger.info(
+                "rank 0 generate done: %s tokens, %.2f tokens/sec",
+                total_processed_tokens,
+                total_processed_tokens / max(total_runtime, 1e-10),
+            )
         generated_tokens = [generated_tokens[seq_id] for seq_id in sorted(generated_tokens.keys())]
         output = {'text': [self.tokenizer.decode(tokens) for tokens in generated_tokens], 'token_ids': generated_tokens}
         return output
